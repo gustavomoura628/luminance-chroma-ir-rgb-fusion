@@ -71,35 +71,35 @@ class FusionPipeline:
     # Public API
     # ------------------------------------------------------------------
 
-    def process(self, ir_gray: np.ndarray, rgb_bgr: np.ndarray) -> np.ndarray:
-        """Full pipeline: warp estimation -> GPU colorize -> BGR output.
+    def process(self, ir_gray: np.ndarray, rgb: np.ndarray) -> np.ndarray:
+        """Full pipeline: warp estimation -> GPU colorize -> RGB output.
 
         Parameters
         ----------
         ir_gray : (H, W) uint8 grayscale IR image.
-        rgb_bgr : (H, W, 3) uint8 BGR color image.
+        rgb : (H, W, 3) uint8 RGB color image.
 
         Returns
         -------
-        (H', W', 3) uint8 BGR fused image (cropped to valid overlap region).
-        Returns grayscale IR as BGR if no valid warp exists yet.
+        (H', W', 3) uint8 RGB fused image (cropped to valid overlap region).
+        Returns grayscale IR as RGB if no valid warp exists yet.
         """
         H, W = ir_gray.shape[:2]
 
         # Submit warp estimation request (non-blocking)
-        self._submit_warp(rgb_bgr, ir_gray)
+        self._submit_warp(rgb, ir_gray)
 
         M = self._M
         if M is None:
-            return cv2.cvtColor(ir_gray, cv2.COLOR_GRAY2BGR)
+            return cv2.cvtColor(ir_gray, cv2.COLOR_GRAY2RGB)
 
         crop = self._compute_crop(M, W, H)
         if crop is None:
-            return cv2.cvtColor(ir_gray, cv2.COLOR_GRAY2BGR)
+            return cv2.cvtColor(ir_gray, cv2.COLOR_GRAY2RGB)
 
         # GPU colorize
         rgb_t = (
-            torch.from_numpy(rgb_bgr)
+            torch.from_numpy(rgb)
             .to(self._device)
             .permute(2, 0, 1)
             .unsqueeze(0)
@@ -142,7 +142,7 @@ class FusionPipeline:
     # Async warp worker
     # ------------------------------------------------------------------
 
-    def _submit_warp(self, rgb_bgr: np.ndarray, ir_gray: np.ndarray) -> None:
+    def _submit_warp(self, rgb: np.ndarray, ir_gray: np.ndarray) -> None:
         if self._frozen:
             return
         # Auto-freeze check
@@ -153,7 +153,7 @@ class FusionPipeline:
         if self.freeze_mode == "on":
             self._frozen = True
             return
-        rgb_gray = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2GRAY)
+        rgb_gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
         with self._lock:
             self._pending = (rgb_gray.copy(), ir_gray.copy())
         self._event.set()
@@ -243,18 +243,18 @@ class FusionPipeline:
         warped = F.grid_sample(
             rgb_t, grid, mode="bilinear", padding_mode="zeros", align_corners=True,
         )
-        B, G, R = warped[0, 0], warped[0, 1], warped[0, 2]
+        R, G, B = warped[0, 0], warped[0, 1], warped[0, 2]
 
         # Extract chroma from warped RGB
-        Cr_off = -0.081 * B - 0.419 * G + 0.500 * R
-        Cb_off = 0.500 * B - 0.331 * G - 0.169 * R
+        Cr_off = 0.500 * R - 0.419 * G - 0.081 * B
+        Cb_off = -0.169 * R - 0.331 * G + 0.500 * B
 
         # Fuse: IR luma + RGB chroma
-        B_out = ir_t + 1.773 * Cb_off
-        G_out = ir_t - 0.714 * Cr_off - 0.344 * Cb_off
         R_out = ir_t + 1.403 * Cr_off
+        G_out = ir_t - 0.714 * Cr_off - 0.344 * Cb_off
+        B_out = ir_t + 1.773 * Cb_off
 
-        return torch.stack([B_out, G_out, R_out], dim=0)
+        return torch.stack([R_out, G_out, B_out], dim=0)
 
     # ------------------------------------------------------------------
     # Runtime parameter updates

@@ -9,7 +9,6 @@
 
   <depend>rclpy</depend>
   <depend>sensor_msgs</depend>
-  <depend>cv_bridge</depend>
   <depend>message_filters</depend>
 
   <test_depend>ament_python</test_depend>

@@ -6,9 +6,12 @@ FusionPipeline, and publishes colorized output.
 
 from __future__ import annotations
 
+import array
+import time
+
 import cv2
+import numpy as np
 import rclpy
-from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType, SetParametersResult
 from rclpy.node import Node
@@ -17,10 +20,13 @@ from sensor_msgs.msg import Image
 from .fusion_pipeline import FusionPipeline
 
 
+def _ms(ns: int) -> str:
+    return f"{ns / 1e6:.1f}ms"
+
+
 class FusionNode(Node):
     def __init__(self) -> None:
         super().__init__("fusion_node")
-        self._bridge = CvBridge()
 
         # Declare parameters
         self.declare_parameter("infra1_topic", "/camera/infra1/image_rect_raw")
@@ -117,28 +123,51 @@ class FusionNode(Node):
     def _sync_callback(
         self, infra1_msg: Image, infra2_msg: Image, color_msg: Image,
     ) -> None:
-        # Convert ROS images to OpenCV
-        ir_left = self._bridge.imgmsg_to_cv2(infra1_msg, desired_encoding="mono8")
-        ir_right = self._bridge.imgmsg_to_cv2(infra2_msg, desired_encoding="mono8")
-        rgb_bgr = self._bridge.imgmsg_to_cv2(color_msg, desired_encoding="bgr8")
+        t0 = time.perf_counter_ns()
+
+        # Convert ROS images to numpy arrays
+        ir_left = np.frombuffer(infra1_msg.data, dtype=np.uint8).reshape(
+            infra1_msg.height, infra1_msg.width,
+        )
+        ir_right = np.frombuffer(infra2_msg.data, dtype=np.uint8).reshape(
+            infra2_msg.height, infra2_msg.width,
+        )
+        rgb = np.frombuffer(color_msg.data, dtype=np.uint8).reshape(
+            color_msg.height, color_msg.width, 3,
+        )
+        if color_msg.encoding == "bgr8":
+            rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
 
         # Resize RGB to match IR if needed
         ir_h, ir_w = ir_left.shape[:2]
-        rgb_h, rgb_w = rgb_bgr.shape[:2]
+        rgb_h, rgb_w = rgb.shape[:2]
         if (rgb_h, rgb_w) != (ir_h, ir_w):
-            rgb_bgr = cv2.resize(rgb_bgr, (ir_w, ir_h))
+            rgb = cv2.resize(rgb, (ir_w, ir_h))
 
-        # Fuse left eye
-        fused_left = self._pipeline_left.process(ir_left, rgb_bgr)
-        left_msg = self._bridge.cv2_to_imgmsg(fused_left, encoding="bgr8")
-        left_msg.header = infra1_msg.header
-        self._pub_left.publish(left_msg)
+        # Fuse both eyes
+        fused_left = self._pipeline_left.process(ir_left, rgb)
+        fused_right = self._pipeline_right.process(ir_right, rgb)
 
-        # Fuse right eye
-        fused_right = self._pipeline_right.process(ir_right, rgb_bgr)
-        right_msg = self._bridge.cv2_to_imgmsg(fused_right, encoding="bgr8")
-        right_msg.header = infra2_msg.header
-        self._pub_right.publish(right_msg)
+        # Publish
+        self._pub_left.publish(self._make_img_msg(fused_left, infra1_msg.header))
+        self._pub_right.publish(self._make_img_msg(fused_right, infra2_msg.header))
+
+        self.get_logger().info(
+            f"{_ms(time.perf_counter_ns() - t0)}/frame",
+            throttle_duration_sec=1.0,
+        )
+
+
+    @staticmethod
+    def _make_img_msg(img: np.ndarray, header) -> Image:
+        msg = Image()
+        msg.header = header
+        msg.height, msg.width = img.shape[:2]
+        msg.encoding = "rgb8"
+        msg.step = msg.width * 3
+        # array.array skips rclpy's per-byte validation (126ms -> 0ms at 640x480)
+        msg.data = array.array("B", img.tobytes())
+        return msg
 
 
 def main(args=None):
