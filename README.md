@@ -27,9 +27,9 @@ The tradeoff with freezing: the warp matrix is a global affine transform, but th
 |-----------|-------|------|---------|
 | Subscribe | infra1 | `sensor_msgs/Image` mono8 | `/camera/infra1/image_rect_raw` |
 | Subscribe | infra2 | `sensor_msgs/Image` mono8 | `/camera/infra2/image_rect_raw` |
-| Subscribe | color | `sensor_msgs/Image` bgr8 | `/camera/color/image_raw` |
-| Publish | fused left | `sensor_msgs/Image` bgr8 | `/camera/fused/left` |
-| Publish | fused right | `sensor_msgs/Image` bgr8 | `/camera/fused/right` |
+| Subscribe | color | `sensor_msgs/Image` rgb8 | `/camera/color/image_raw` |
+| Publish | fused left | `sensor_msgs/Image` rgb8 | `/camera/fused/left` |
+| Publish | fused right | `sensor_msgs/Image` rgb8 | `/camera/fused/right` |
 
 All topic names are configurable via ROS params.
 
@@ -78,5 +78,5 @@ ros2 param set /fusion_node freeze_after 10.0
 ## Dependencies
 
 - ROS2 Humble
-- `cv_bridge`, `message_filters`, `sensor_msgs`
+- `message_filters`, `sensor_msgs`
 - Python: OpenCV, NumPy, PyTorch (CUDA recommended)
