@@ -51,6 +51,13 @@ class FusionNode(Node):
                 type=ParameterType.PARAMETER_DOUBLE,
             ),
         )
+        self.declare_parameter(
+            "crop", False,
+            ParameterDescriptor(
+                description="Crop to valid overlap region (true) or full IR frame (false)",
+                type=ParameterType.PARAMETER_BOOL,
+            ),
+        )
         # Read initial values
         infra1_topic = self.get_parameter("infra1_topic").value
         infra2_topic = self.get_parameter("infra2_topic").value
@@ -62,6 +69,7 @@ class FusionNode(Node):
         ema_alpha = self.get_parameter("ema_alpha").value
         freeze_mode = self.get_parameter("freeze_mode").value
         freeze_after = self.get_parameter("freeze_after").value
+        crop = self.get_parameter("crop").value
         # Pipeline (one per eye — left uses infra1, right uses infra2)
         device = "cuda"
         self._pipeline_left = FusionPipeline(
@@ -70,6 +78,7 @@ class FusionNode(Node):
             ema_alpha=ema_alpha,
             freeze_mode=freeze_mode,
             freeze_after=freeze_after,
+            crop=crop,
         )
         self._pipeline_right = FusionPipeline(
             device=device,
@@ -77,6 +86,7 @@ class FusionNode(Node):
             ema_alpha=ema_alpha,
             freeze_mode=freeze_mode,
             freeze_after=freeze_after,
+            crop=crop,
         )
 
         # Dynamic parameter callback
@@ -118,6 +128,10 @@ class FusionNode(Node):
                 self._pipeline_left.set_freeze_after(param.value)
                 self._pipeline_right.set_freeze_after(param.value)
                 self.get_logger().info(f"freeze_after -> {param.value}")
+            elif param.name == "crop":
+                self._pipeline_left.crop = param.value
+                self._pipeline_right.crop = param.value
+                self.get_logger().info(f"crop -> {param.value}")
         return SetParametersResult(successful=True)
 
     def _sync_callback(

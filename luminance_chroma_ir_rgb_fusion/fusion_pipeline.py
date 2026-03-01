@@ -35,6 +35,9 @@ class FusionPipeline:
         "off"  — never freeze, EMA runs continuously.
     freeze_after : float
         Seconds of EMA before auto-freezing (only used when freeze_mode="auto").
+    crop : bool
+        If True, output is cropped to the valid RGB/IR overlap region.
+        If False, output is the full IR frame with grayscale borders.
     """
 
     def __init__(
@@ -44,12 +47,14 @@ class FusionPipeline:
         ema_alpha: float = 0.2,
         freeze_mode: str = "auto",
         freeze_after: float = 5.0,
+        crop: bool = False,
     ) -> None:
         self._device = torch.device(device if torch.cuda.is_available() else "cpu")
         self._orb_features = orb_features
         self._ema_alpha = ema_alpha
         self.freeze_mode = freeze_mode
         self.freeze_after = freeze_after
+        self.crop = crop
 
         # Warp state
         self._M: np.ndarray | None = None
@@ -97,6 +102,9 @@ class FusionPipeline:
         if crop is None:
             return cv2.cvtColor(ir_gray, cv2.COLOR_GRAY2RGB)
 
+        # Full-frame mode: color where RGB covers, grayscale borders elsewhere
+        roi = crop if self.crop else (0, 0, W, H)
+
         # GPU colorize
         rgb_t = (
             torch.from_numpy(rgb)
@@ -105,7 +113,7 @@ class FusionPipeline:
             .unsqueeze(0)
             .float()
         )
-        result_t = self._gpu_colorize(rgb_t, ir_gray, M, crop, H, W)
+        result_t = self._gpu_colorize(rgb_t, ir_gray, M, roi, H, W)
         return result_t.clamp(0, 255).byte().permute(1, 2, 0).contiguous().cpu().numpy()
 
     # ------------------------------------------------------------------

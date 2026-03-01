@@ -10,3 +10,4 @@ fusion_node:
     ema_alpha: 0.2
     freeze_mode: "auto"
     freeze_after: 5.0
+    crop: false
