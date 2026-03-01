@@ -21,7 +21,12 @@ from .fusion_pipeline import FusionPipeline
 
 
 def _ms(ns: int) -> str:
-    return f"{ns / 1e6:.1f}ms"
+    return f"{ns / 1e6:.1f}"
+
+
+def _fmt_pipeline(label: str, total_ns: int, timings: dict[str, int]) -> str:
+    parts = [f"{k}={_ms(v)}" for k, v in timings.items()]
+    return f"{label}={_ms(total_ns)}({' '.join(parts)})"
 
 
 class FusionNode(Node):
@@ -137,7 +142,8 @@ class FusionNode(Node):
     def _sync_callback(
         self, infra1_msg: Image, infra2_msg: Image, color_msg: Image,
     ) -> None:
-        t0 = time.perf_counter_ns()
+        _t = time.perf_counter_ns
+        t0 = _t()
 
         # Convert ROS images to numpy arrays
         ir_left = np.frombuffer(infra1_msg.data, dtype=np.uint8).reshape(
@@ -151,23 +157,33 @@ class FusionNode(Node):
         )
         if color_msg.encoding == "bgr8":
             rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+        t1 = _t()
 
         # Resize RGB to match IR if needed
         ir_h, ir_w = ir_left.shape[:2]
         rgb_h, rgb_w = rgb.shape[:2]
         if (rgb_h, rgb_w) != (ir_h, ir_w):
             rgb = cv2.resize(rgb, (ir_w, ir_h))
+        t2 = _t()
 
         # Fuse both eyes
         fused_left = self._pipeline_left.process(ir_left, rgb)
+        t3 = _t()
         fused_right = self._pipeline_right.process(ir_right, rgb)
+        t4 = _t()
 
         # Publish
         self._pub_left.publish(self._make_img_msg(fused_left, infra1_msg.header))
+        t5 = _t()
         self._pub_right.publish(self._make_img_msg(fused_right, infra2_msg.header))
+        t6 = _t()
 
         self.get_logger().info(
-            f"{_ms(time.perf_counter_ns() - t0)}/frame",
+            f"{_ms(t6 - t0)}ms/frame | "
+            f"decode={_ms(t1 - t0)} resize={_ms(t2 - t1)} "
+            f"{_fmt_pipeline('L', t3 - t2, self._pipeline_left.timings)} "
+            f"{_fmt_pipeline('R', t4 - t3, self._pipeline_right.timings)} "
+            f"pub_L={_ms(t5 - t4)} pub_R={_ms(t6 - t5)}",
             throttle_duration_sec=1.0,
         )
 

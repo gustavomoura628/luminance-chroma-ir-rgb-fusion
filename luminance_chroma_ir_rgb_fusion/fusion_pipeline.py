@@ -72,6 +72,9 @@ class FusionPipeline:
         self._worker = threading.Thread(target=self._warp_worker, daemon=True)
         self._worker.start()
 
+        # Per-frame timing breakdown (nanoseconds)
+        self.timings: dict[str, int] = {}
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -89,17 +92,23 @@ class FusionPipeline:
         (H', W', 3) uint8 RGB fused image (cropped to valid overlap region).
         Returns grayscale IR as RGB if no valid warp exists yet.
         """
+        _t = time.perf_counter_ns
         H, W = ir_gray.shape[:2]
 
         # Submit warp estimation request (non-blocking)
+        t0 = _t()
         self._submit_warp(rgb, ir_gray)
+        t1 = _t()
 
         M = self._M
         if M is None:
+            self.timings = {"submit": t1 - t0}
             return cv2.cvtColor(ir_gray, cv2.COLOR_GRAY2RGB)
 
         crop = self._compute_crop(M, W, H)
+        t2 = _t()
         if crop is None:
+            self.timings = {"submit": t1 - t0, "crop": t2 - t1}
             return cv2.cvtColor(ir_gray, cv2.COLOR_GRAY2RGB)
 
         # Full-frame mode: color where RGB covers, grayscale borders elsewhere
@@ -113,8 +122,20 @@ class FusionPipeline:
             .unsqueeze(0)
             .float()
         )
+        t3 = _t()
         result_t = self._gpu_colorize(rgb_t, ir_gray, M, roi, H, W)
-        return result_t.clamp(0, 255).byte().permute(1, 2, 0).contiguous().cpu().numpy()
+        t4 = _t()
+        out = result_t.clamp(0, 255).byte().permute(1, 2, 0).contiguous().cpu().numpy()
+        t5 = _t()
+
+        self.timings = {
+            "submit": t1 - t0,
+            "crop": t2 - t1,
+            "to_gpu": t3 - t2,
+            "colorize": t4 - t3,
+            "to_cpu": t5 - t4,
+        }
+        return out
 
     # ------------------------------------------------------------------
     # ORB warp estimation
