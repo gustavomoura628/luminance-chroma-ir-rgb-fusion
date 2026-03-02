@@ -44,7 +44,8 @@ Baseline: ROS2 node, stereo (L+R eyes), 640x480/eye, frozen warp, rosbag source,
 | 2 | Reuse Image msg object + split pub timing | 5.3-5.9ms | ~-0.2ms | replaced |
 | 3 | torch.set_num_threads(1) | 5.3-5.9ms | ~0ms | reverted — no effect on latency or CPU usage |
 | 4 | Shared RGB upload (node uploads once, both eyes reuse) | 4.5-5.1ms | ~-0.8ms | replaced |
-| 5 | Fuse color math into single matmul (3x3 @ warped) | 3.9-4.3ms | ~-0.4ms | **active** |
+| 5 | Fuse color math into single matmul (3x3 @ warped) | 3.9-4.3ms | ~-0.4ms | replaced |
+| 6 | Pre-alloc pinned download + in-place clamp | 3.7-4.1ms | ~-0.2ms | **active** |
 
 ### Breakdown rev 0 — baseline (frozen warp)
 
@@ -145,13 +146,36 @@ dds_R:     0.3ms
 total:     3.9-4.3ms typical, best 3.9ms
 ```
 
-### Top bottlenecks (target: <4ms — achieved on best frames)
+### Breakdown rev 6 — pre-alloc pinned download (frozen warp)
 
-1. **to_cpu (~1.0ms combined)** — clamp → byte → permute → contiguous → .cpu() → .numpy()
-   chain. Pre-allocated pinned download buffers + in-place ops could help.
-2. **rgb_up (~0.7ms)** — per-frame allocation. Pinned pre-allocated buffer would help.
-3. **DDS publish (~1.1ms combined)** — rclpy C-level floor. Needs zero-copy transport or
+```
+decode:    0.0ms
+resize:    0.0ms
+rgb_up:    0.7ms
+
+L pipeline: 1.1-1.2ms
+  submit:  0.0ms
+  crop:    0.1ms
+  to_gpu:  0.0ms
+  colorize: 1.0-1.1ms  (now includes download via pinned buffers)
+
+R pipeline: 0.8-0.9ms
+  colorize: 0.8ms
+
+msg_L:     0.2ms
+dds_L:     0.4ms
+msg_R:     0.2ms
+dds_R:     0.3ms
+
+total:     3.7-4.1ms typical, best 3.7ms
+```
+
+### Top bottlenecks
+
+1. **rgb_up (~0.7ms)** — per-frame allocation. Pinned pre-allocated buffer would help.
+2. **DDS publish (~1.1ms combined)** — rclpy C-level floor. Needs zero-copy transport or
    C extension to improve.
+3. **colorize (~1.8ms combined)** — mostly transfer time now, compute is minimal.
 
 ## Ideas backlog
 

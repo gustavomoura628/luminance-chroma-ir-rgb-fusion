@@ -62,6 +62,11 @@ class FusionPipeline:
         self._grid: torch.Tensor | None = None
         self._grid_key: object = None  # (id(M), crop) cache key
 
+        # Pre-allocated download buffers (lazy init, keyed by ROI size)
+        self._dl_key: tuple[int, int] | None = None
+        self._dl_gpu_u8: torch.Tensor | None = None      # (3, roi_h, roi_w) uint8 GPU
+        self._dl_pinned: torch.Tensor | None = None       # (roi_h, roi_w, 3) uint8 pinned
+
         # Pre-computed color matrix: fuse(3x2) @ chroma(2x3) = (3x3)
         # Combines chroma extraction + luma fusion into one matmul.
         #   chroma: RGB → (Cr, Cb) offsets
@@ -138,17 +143,14 @@ class FusionPipeline:
                 .float()
             )
         t3 = _t()
-        result_t = self._gpu_colorize(rgb_t, ir_gray, M, roi, H, W)
+        out = self._gpu_colorize(rgb_t, ir_gray, M, roi, H, W)
         t4 = _t()
-        out = result_t.clamp(0, 255).byte().permute(1, 2, 0).contiguous().cpu().numpy()
-        t5 = _t()
 
         self.timings = {
             "submit": t1 - t0,
             "crop": t2 - t1,
             "to_gpu": t3 - t2,
             "colorize": t4 - t3,
-            "to_cpu": t5 - t4,
         }
         return out
 
@@ -271,9 +273,13 @@ class FusionPipeline:
         crop: tuple[int, int, int, int],
         H: int,
         W: int,
-    ) -> torch.Tensor:
-        """Warp RGB via grid_sample, fuse luma from IR + chroma from RGB."""
+    ) -> np.ndarray:
+        """Warp RGB via grid_sample, fuse luma from IR + chroma from RGB.
+
+        Returns (roi_h, roi_w, 3) uint8 numpy array backed by pinned memory.
+        """
         x1, y1, x2, y2 = crop
+        roi_h, roi_w = y2 - y1, x2 - x1
 
         # Cache grid — rebuild only when M or crop changes
         cache_key = (id(M), crop)
@@ -289,10 +295,23 @@ class FusionPipeline:
         )
 
         # Fused color math: M_color(3,3) @ warped(3,N) + IR luma
-        # Replaces ~13 scalar temp allocations with one matmul + one add.
-        roi_h, roi_w = y2 - y1, x2 - x1
         chroma = torch.mm(self._M_color, warped.squeeze(0).reshape(3, -1))
-        return chroma.view(3, roi_h, roi_w) + ir_t.unsqueeze(0)
+        fused = chroma.view(3, roi_h, roi_w) + ir_t.unsqueeze(0)
+
+        # Download: clamp in-place → cast to u8 on GPU → copy to pinned host
+        fused.clamp_(0, 255)
+        dl_key = (roi_h, roi_w)
+        if self._dl_key != dl_key:
+            self._dl_key = dl_key
+            self._dl_gpu_u8 = torch.empty(
+                (3, roi_h, roi_w), dtype=torch.uint8, device=self._device,
+            )
+            self._dl_pinned = torch.empty(
+                (roi_h, roi_w, 3), dtype=torch.uint8,
+            ).pin_memory()
+        self._dl_gpu_u8.copy_(fused)
+        self._dl_pinned.copy_(self._dl_gpu_u8.permute(1, 2, 0))
+        return self._dl_pinned.numpy()
 
     # ------------------------------------------------------------------
     # Runtime parameter updates
