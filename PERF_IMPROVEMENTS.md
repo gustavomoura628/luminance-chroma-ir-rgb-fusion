@@ -243,8 +243,50 @@ total:        1.4-1.8ms typical, best 1.2ms, spikes to 2.4ms
 | Python GIL / interpreter overhead | ~0.1ms | 0 |
 | rclpy CDR serialize vs rclcpp | ~0.3ms | ~0.2ms |
 
+### Inter-frame jitter investigation
+
+The C++ rewrite processes frames in 1.4-1.8ms, but subscribers see **150-340ms peak spikes**
+in inter-frame timing. Investigation with rolling 2s stats on both the fusion node and a
+dedicated SDL2/ImGui stream viewer confirmed:
+
+**Fusion node stats (publisher side):**
+```
+30 fps | interval avg 33.3ms peak 301.6ms | proc avg 1.6ms peak 2.4ms
+27 fps | interval avg 37.3ms peak 343.0ms | proc avg 1.6ms peak 2.6ms
+```
+
+- Processing time is rock solid (1.5-1.7ms avg, 2.8ms worst)
+- Inter-callback interval peaks at 280-343ms — the sync callback itself fires late
+
+**Viewer stats (subscriber side):**
+```
+IR       30 fps   33.3ms  peak  50.9ms
+Fused    27 fps   36.5ms  peak 299.3ms
+RGB      24 fps   41.8ms  peak 100.5ms
+```
+
+- IR (direct from RealSense driver): stable 30fps, peaks ~50ms
+- Fused: mirrors the fusion node's interval jitter exactly
+- RGB (direct from driver): 24-28fps with ~100ms peaks
+
+**Root cause: `message_filters::ApproximateTime` synchronizer.** The fusion callback only
+fires when a matching triplet (infra1 + infra2 + color) arrives within the sync slop window
+(20ms default). The RGB camera arrives on a separate USB pipeline with independent timing.
+When one RGB frame is delayed (USB scheduling, driver buffering), the synchronizer holds
+all three streams until a match is found — causing a ~300ms gap followed by a burst of
+catch-up frames.
+
+This is upstream of the fusion node — no amount of kernel optimization can fix it.
+
+**Possible mitigations:**
+- Decouple from ApproximateTime sync — use latest-available RGB with each IR pair
+- Reduce sync_slop to drop stale triplets faster (but loses frames)
+- Pin USB interrupts to dedicated cores
+- Use hardware-sync'd cameras (e.g. RealSense multi-cam sync cable)
+
 ## Ideas backlog
 
 - **Zero-copy DDS** (Cyclone DDS + iceoryx shared memory) — eliminate the final memcpy + serialize
 - **Keep RGB on GPU** if source can deliver it there directly (e.g. nvdec)
 - **CUDA graph capture** — record the kernel launch pattern once, replay with near-zero CPU overhead
+- **Decouple RGB sync** — use latest RGB instead of ApproximateTime to eliminate 300ms jitter spikes

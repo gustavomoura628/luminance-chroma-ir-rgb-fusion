@@ -1,6 +1,7 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <string>
 #include <vector>
 
@@ -71,6 +72,15 @@ private:
 
     // Parameter callback handle (prevent GC)
     rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_;
+
+    // Rolling stats (2s window)
+    using SteadyClock = std::chrono::steady_clock;
+    using TimePoint = SteadyClock::time_point;
+    struct FrameRecord { TimePoint stamp; double total_ms; };
+    std::deque<FrameRecord> frame_log_;
+    TimePoint last_stats_log_ = SteadyClock::now();
+    TimePoint prev_callback_ = {};
+    double peak_interval_ms_ = 0;
 
     // ---------------------------------------------------------------
     void declare_params() {
@@ -297,18 +307,42 @@ private:
 
         auto t5 = std::chrono::steady_clock::now();
 
-        // Timing log (throttled to ~1Hz)
-        static auto last_log = std::chrono::steady_clock::now();
-        if (t5 - last_log > std::chrono::seconds(1)) {
-            last_log = t5;
-            auto ms = [](auto a, auto b) {
-                return std::chrono::duration<double, std::milli>(b - a).count();
-            };
-            RCLCPP_INFO(get_logger(),
-                "%.1fms/frame | decode=%.1f rgb_up=%.1f "
-                "launch=%.1f L_sync+pub=%.1f R_sync+pub=%.1f",
-                ms(t0, t5), ms(t0, t1), ms(t1, t2),
-                ms(t2, t3), ms(t3, t4), ms(t4, t5));
+        // Rolling stats
+        auto ms = [](auto a, auto b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        double total = ms(t0, t5);
+        if (prev_callback_ != TimePoint{}) {
+            double gap = ms(prev_callback_, t0);
+            if (gap > peak_interval_ms_) peak_interval_ms_ = gap;
+        }
+        prev_callback_ = t0;
+        frame_log_.push_back({t0, total});
+
+        if (ms(last_stats_log_, t5) >= 2000.0) {
+            // Prune older than 2s
+            auto cutoff = t5 - std::chrono::seconds(2);
+            while (!frame_log_.empty() && frame_log_.front().stamp < cutoff)
+                frame_log_.pop_front();
+
+            size_t n = frame_log_.size();
+            if (n >= 2) {
+                double span = ms(frame_log_.front().stamp, frame_log_.back().stamp);
+                double avg_interval = span / (n - 1);
+                double fps = (avg_interval > 0) ? 1000.0 / avg_interval : 0;
+
+                double sum = 0, proc_worst = 0;
+                for (auto& f : frame_log_) {
+                    sum += f.total_ms;
+                    if (f.total_ms > proc_worst) proc_worst = f.total_ms;
+                }
+
+                RCLCPP_INFO(get_logger(),
+                    "%.0f fps | interval avg %.1fms peak %.1fms | proc avg %.1fms peak %.1fms",
+                    fps, avg_interval, peak_interval_ms_, sum / n, proc_worst);
+            }
+            peak_interval_ms_ = 0;
+            last_stats_log_ = t5;
         }
     }
 };

@@ -263,9 +263,22 @@ int main(int argc, char** argv) {
 
     bool flip_lr = false;
     bool quit = false;
+    auto last_log = std::chrono::steady_clock::now();
 
     // --- Main loop ---
     while (!quit && rclcpp::ok()) {
+        // Log stats every 2 seconds
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double>(now - last_log).count() >= 2.0) {
+            last_log = now;
+            for (int si = 0; si < 3; ++si) {
+                if (!streams[si].enabled) continue;
+                auto& s = streams[si].stats;
+                RCLCPP_INFO(node->get_logger(), "%-5s  %4.0f fps  %5.1f ms  peak %5.1f ms",
+                    stream_names[si], s.avg_fps, s.avg_ms, s.peak_ms);
+            }
+        }
+
         // Poll events
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
