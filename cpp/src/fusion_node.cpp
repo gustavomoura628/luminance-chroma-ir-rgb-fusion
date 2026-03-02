@@ -1,7 +1,9 @@
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -18,7 +20,7 @@
 #include "ir_rgb_fusion_cuda/fusion_pipeline.hpp"
 
 using sensor_msgs::msg::Image;
-using SyncPolicy = message_filters::sync_policies::ApproximateTime<Image, Image, Image>;
+using SyncPolicy = message_filters::sync_policies::ApproximateTime<Image, Image>;
 
 class FusionNode : public rclcpp::Node {
 public:
@@ -62,10 +64,16 @@ private:
     // ROS
     std::shared_ptr<message_filters::Subscriber<Image>> sub_infra1_;
     std::shared_ptr<message_filters::Subscriber<Image>> sub_infra2_;
-    std::shared_ptr<message_filters::Subscriber<Image>> sub_color_;
     std::shared_ptr<message_filters::Synchronizer<SyncPolicy>> sync_;
+    rclcpp::Subscription<Image>::SharedPtr sub_color_;
+    rclcpp::CallbackGroup::SharedPtr rgb_cbg_;
     rclcpp::Publisher<Image>::SharedPtr pub_left_;
     rclcpp::Publisher<Image>::SharedPtr pub_right_;
+
+    // Latest RGB frame (written by rgb_callback, read by sync_callback)
+    std::mutex rgb_mutex_;
+    std::condition_variable rgb_cv_;
+    Image::ConstSharedPtr latest_rgb_;
 
     // Pre-allocated output messages
     Image msg_left_, msg_right_;
@@ -81,6 +89,10 @@ private:
     TimePoint last_stats_log_ = SteadyClock::now();
     TimePoint prev_callback_ = {};
     double peak_interval_ms_ = 0;
+    double rgb_age_sum_ = 0;
+    double rgb_age_peak_ = 0;
+    int rgb_age_count_ = 0;
+    int rgb_fresh_count_ = 0;
 
     // ---------------------------------------------------------------
     void declare_params() {
@@ -138,16 +150,24 @@ private:
             this, infra1_topic_);
         sub_infra2_ = std::make_shared<message_filters::Subscriber<Image>>(
             this, infra2_topic_);
-        sub_color_ = std::make_shared<message_filters::Subscriber<Image>>(
-            this, color_topic_);
 
+        // IR pair sync only — RGB decoupled for peek-ahead
         sync_ = std::make_shared<message_filters::Synchronizer<SyncPolicy>>(
-            SyncPolicy(10), *sub_infra1_, *sub_infra2_, *sub_color_);
+            SyncPolicy(10), *sub_infra1_, *sub_infra2_);
         sync_->setMaxIntervalDuration(rclcpp::Duration::from_seconds(sync_slop_));
         sync_->registerCallback(
             std::bind(&FusionNode::sync_callback, this,
-                      std::placeholders::_1, std::placeholders::_2,
-                      std::placeholders::_3));
+                      std::placeholders::_1, std::placeholders::_2));
+
+        // RGB in its own callback group so it can fire during the 2ms wait
+        rgb_cbg_ = create_callback_group(
+            rclcpp::CallbackGroupType::MutuallyExclusive);
+        rclcpp::SubscriptionOptions rgb_opts;
+        rgb_opts.callback_group = rgb_cbg_;
+        sub_color_ = create_subscription<Image>(
+            color_topic_, rclcpp::QoS(10),
+            std::bind(&FusionNode::rgb_callback, this, std::placeholders::_1),
+            rgb_opts);
 
         pub_left_ = create_publisher<Image>(fused_left_topic_, 10);
         pub_right_ = create_publisher<Image>(fused_right_topic_, 10);
@@ -157,6 +177,14 @@ private:
             [this](const std::vector<rclcpp::Parameter>& params) {
                 return on_param_change(params);
             });
+    }
+
+    void rgb_callback(Image::ConstSharedPtr msg) {
+        {
+            std::lock_guard<std::mutex> lock(rgb_mutex_);
+            latest_rgb_ = std::move(msg);
+        }
+        rgb_cv_.notify_one();
     }
 
     // ---------------------------------------------------------------
@@ -216,10 +244,39 @@ private:
     // ---------------------------------------------------------------
     void sync_callback(
         const Image::ConstSharedPtr& infra1_msg,
-        const Image::ConstSharedPtr& infra2_msg,
-        const Image::ConstSharedPtr& color_msg)
+        const Image::ConstSharedPtr& infra2_msg)
     {
         auto t0 = std::chrono::steady_clock::now();
+
+        // Peek-ahead: wait up to 2ms for fresh RGB if current is stale
+        Image::ConstSharedPtr color_msg;
+        {
+            std::unique_lock<std::mutex> lock(rgb_mutex_);
+            rclcpp::Time ir_stamp(infra1_msg->header.stamp);
+
+            auto is_fresh = [&]() -> bool {
+                if (!latest_rgb_) return false;
+                double age = (ir_stamp -
+                    rclcpp::Time(latest_rgb_->header.stamp)).seconds();
+                return age < 0.005; // RGB within 5ms of IR
+            };
+
+            if (!is_fresh()) {
+                rgb_cv_.wait_for(lock, std::chrono::milliseconds(5), is_fresh);
+            }
+            color_msg = latest_rgb_;
+
+            if (color_msg) {
+                double age_ms = (ir_stamp -
+                    rclcpp::Time(color_msg->header.stamp)).seconds() * 1000.0;
+                rgb_age_sum_ += age_ms;
+                if (age_ms > rgb_age_peak_) rgb_age_peak_ = age_ms;
+                rgb_age_count_++;
+                if (is_fresh()) rgb_fresh_count_++;
+            }
+        }
+
+        if (!color_msg) return; // No RGB yet
 
         // Decode images — zero-copy cv::Mat wrappers over msg data
         int ir_h = infra1_msg->height, ir_w = infra1_msg->width;
@@ -337,11 +394,17 @@ private:
                     if (f.total_ms > proc_worst) proc_worst = f.total_ms;
                 }
 
+                double rgb_avg = (rgb_age_count_ > 0) ? rgb_age_sum_ / rgb_age_count_ : 0;
+                int fresh_pct = (rgb_age_count_ > 0) ? rgb_fresh_count_ * 100 / rgb_age_count_ : 0;
                 RCLCPP_INFO(get_logger(),
-                    "%.0f fps | interval avg %.1fms peak %.1fms | proc avg %.1fms peak %.1fms",
-                    fps, avg_interval, peak_interval_ms_, sum / n, proc_worst);
+                    "%.0f fps | interval avg %.1fms peak %.1fms | proc avg %.1fms peak %.1fms"
+                    " | rgb age avg %.1fms peak %.1fms fresh %d%%",
+                    fps, avg_interval, peak_interval_ms_, sum / n, proc_worst,
+                    rgb_avg, rgb_age_peak_, fresh_pct);
             }
             peak_interval_ms_ = 0;
+            rgb_age_sum_ = rgb_age_peak_ = 0;
+            rgb_age_count_ = rgb_fresh_count_ = 0;
             last_stats_log_ = t5;
         }
     }
@@ -350,7 +413,9 @@ private:
 int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<FusionNode>();
-    rclcpp::spin(node);
+    rclcpp::executors::MultiThreadedExecutor executor;
+    executor.add_node(node);
+    executor.spin();
     rclcpp::shutdown();
     return 0;
 }
