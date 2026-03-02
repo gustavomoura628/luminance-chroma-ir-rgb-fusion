@@ -15,3 +15,6 @@ fusion_node:
     lock_rotation: "off"
     freeze_after: 5.0
     crop: true
+    # Do not modify unless you know what you are doing
+    #min_inliers: 20
+    #min_inlier_ratio: 0.25

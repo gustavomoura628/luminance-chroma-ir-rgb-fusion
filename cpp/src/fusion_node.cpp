@@ -113,6 +113,16 @@ private:
         lock_rotation_desc.description = "Rotation lock mode: \"auto\", \"on\", or \"off\"";
         declare_parameter("lock_rotation", "off", lock_rotation_desc);
 
+        rcl_interfaces::msg::ParameterDescriptor min_inliers_desc;
+        min_inliers_desc.description =
+            "Min RANSAC inlier count to accept a warp estimate. Do not modify unless you know what you are doing";
+        declare_parameter("min_inliers", 20, min_inliers_desc);
+
+        rcl_interfaces::msg::ParameterDescriptor min_inlier_ratio_desc;
+        min_inlier_ratio_desc.description =
+            "Min RANSAC inlier ratio to accept a warp estimate. Do not modify unless you know what you are doing";
+        declare_parameter("min_inlier_ratio", 0.25, min_inlier_ratio_desc);
+
         rcl_interfaces::msg::ParameterDescriptor crop_desc;
         crop_desc.description = "Crop to valid overlap region (true) or full IR frame (false)";
         declare_parameter("crop", false, crop_desc);
@@ -141,6 +151,8 @@ private:
         p.freeze_after = static_cast<float>(get_parameter("freeze_after").as_double());
         p.crop = get_parameter("crop").as_bool();
         p.lock_rotation = get_parameter("lock_rotation").as_string();
+        p.min_inliers = get_parameter("min_inliers").as_int();
+        p.min_inlier_ratio = get_parameter("min_inlier_ratio").as_double();
 
         pipeline_left_ = std::make_unique<FusionPipeline>(p);
         pipeline_right_ = std::make_unique<FusionPipeline>(p);
@@ -267,6 +279,16 @@ private:
                 pipeline_left_->set_lock_rotation(v);
                 pipeline_right_->set_lock_rotation(v);
                 RCLCPP_INFO(get_logger(), "lock_rotation -> %s", v.c_str());
+            } else if (p.get_name() == "min_inliers") {
+                auto v = static_cast<int>(p.as_int());
+                pipeline_left_->set_min_inliers(v);
+                pipeline_right_->set_min_inliers(v);
+                RCLCPP_INFO(get_logger(), "min_inliers -> %d", v);
+            } else if (p.get_name() == "min_inlier_ratio") {
+                auto v = p.as_double();
+                pipeline_left_->set_min_inlier_ratio(v);
+                pipeline_right_->set_min_inlier_ratio(v);
+                RCLCPP_INFO(get_logger(), "min_inlier_ratio -> %.2f", v);
             } else if (p.get_name() == "crop") {
                 pipeline_left_->set_crop(p.as_bool());
                 pipeline_right_->set_crop(p.as_bool());
@@ -427,11 +449,21 @@ private:
 
                 double rgb_avg = (rgb_age_count_ > 0) ? rgb_age_sum_ / rgb_age_count_ : 0;
                 int fresh_pct = (rgb_age_count_ > 0) ? rgb_fresh_count_ * 100 / rgb_age_count_ : 0;
+
+                auto wl = pipeline_left_->get_and_reset_warp_stats();
+                auto wr = pipeline_right_->get_and_reset_warp_stats();
+                int warp_good = wl.good + wr.good;
+                int warp_bad = wl.rejected + wr.rejected;
+                int warp_total = warp_good + warp_bad;
+                int warp_good_pct = (warp_total > 0) ? warp_good * 100 / warp_total : 0;
+
                 RCLCPP_INFO(get_logger(),
                     "%.0f fps | interval avg %.1fms peak %.1fms | proc avg %.1fms peak %.1fms"
-                    " | rgb age avg %.1fms peak %.1fms fresh %d%%",
+                    " | rgb age avg %.1fms peak %.1fms fresh %d%%"
+                    " | warp %d/%d good (%d%%)",
                     fps, avg_interval, peak_interval_ms_, sum / n, proc_worst,
-                    rgb_avg, rgb_age_peak_, fresh_pct);
+                    rgb_avg, rgb_age_peak_, fresh_pct,
+                    warp_good, warp_total, warp_good_pct);
             }
             peak_interval_ms_ = 0;
             rgb_age_sum_ = rgb_age_peak_ = 0;

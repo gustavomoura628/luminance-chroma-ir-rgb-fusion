@@ -28,6 +28,9 @@ public:
         std::string lock_rotation = "off"; // "auto", "on", "off"
         float freeze_after = 5.0f;
         bool crop = false;
+        // RANSAC quality gate — do not modify unless you know what you are doing
+        int min_inliers = 20;
+        double min_inlier_ratio = 0.25;
     };
 
     explicit FusionPipeline(const Params& params);
@@ -62,6 +65,14 @@ public:
     void set_crop(bool crop);
     bool get_crop() const { return params_.crop; }
     void set_lock_rotation(const std::string& mode);
+    void set_min_inliers(int v) { params_.min_inliers = v; }
+    void set_min_inlier_ratio(double v) { params_.min_inlier_ratio = v; }
+
+    struct WarpStats {
+        int good = 0;
+        int rejected = 0;
+    };
+    WarpStats get_and_reset_warp_stats();
 
 private:
     Params params_;
@@ -84,6 +95,10 @@ private:
     double locked_theta_ = 0.0;
     std::optional<Roi> locked_crop_;
     void constrain_rotation(cv::Mat& M) const;
+
+    // Warp quality counters (updated by worker, read+reset by node)
+    std::atomic<int> warp_good_{0};
+    std::atomic<int> warp_rejected_{0};
 
     // Background ORB worker
     std::mutex pending_mutex_;

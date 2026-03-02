@@ -178,6 +178,15 @@ void FusionPipeline::warp_worker() {
             pts1, pts2, inliers, cv::RANSAC, 5.0);
         if (M.empty()) continue;
 
+        // Reject low-quality frames — keep previous warp
+        int inlier_count = cv::countNonZero(inliers);
+        double inlier_ratio = static_cast<double>(inlier_count) / matches.size();
+        if (inlier_count < params_.min_inliers || inlier_ratio < params_.min_inlier_ratio) {
+            warp_rejected_.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        warp_good_.fetch_add(1, std::memory_order_relaxed);
+
         // Constrain rotation before EMA if locked
         if (rotation_locked_.load(std::memory_order_acquire)) {
             constrain_rotation(M);
@@ -383,6 +392,13 @@ void FusionPipeline::set_freeze_after(float seconds) {
 
 void FusionPipeline::set_crop(bool crop) {
     params_.crop = crop;
+}
+
+FusionPipeline::WarpStats FusionPipeline::get_and_reset_warp_stats() {
+    WarpStats s;
+    s.good = warp_good_.exchange(0, std::memory_order_relaxed);
+    s.rejected = warp_rejected_.exchange(0, std::memory_order_relaxed);
+    return s;
 }
 
 void FusionPipeline::set_lock_rotation(const std::string& mode) {

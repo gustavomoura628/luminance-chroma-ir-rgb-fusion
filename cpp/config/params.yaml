@@ -11,7 +11,10 @@ fusion_node:
     sync_slop: 0.005
     orb_features: 1000
     ema_alpha: 0.05
-    freeze_mode: "off"
-    lock_rotation: "on"
+    freeze_mode: "auto"
+    lock_rotation: "auto"
     freeze_after: 5.0
     crop: true
+    # Do not modify unless you know what you are doing
+    #min_inliers: 20
+    #min_inlier_ratio: 0.25
