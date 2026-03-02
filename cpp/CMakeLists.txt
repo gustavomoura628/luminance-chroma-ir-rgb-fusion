@@ -11,7 +11,6 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
-find_package(message_filters REQUIRED)
 find_package(rcl_interfaces REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc features2d calib3d)
 # Distro nvidia-cuda-toolkit puts headers in /usr/include, not /usr/local/cuda
@@ -47,7 +46,6 @@ target_link_libraries(fusion_node
 ament_target_dependencies(fusion_node
   rclcpp
   sensor_msgs
-  message_filters
   rcl_interfaces
 )
 

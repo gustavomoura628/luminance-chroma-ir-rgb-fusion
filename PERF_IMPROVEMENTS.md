@@ -216,7 +216,8 @@ Rewrote the entire pipeline as a C++ node (`cpp/` directory) with:
 
 | # | Change | Typical frame | Delta | Status |
 |---|--------|---------------|-------|--------|
-| 8 | C++ CUDA rewrite | 1.4-1.8ms | **-2.3ms** | **active** |
+| 8 | C++ CUDA rewrite | 1.4-1.8ms | **-2.3ms** | carried forward |
+| 9 | Event-driven 3-topic sync (drop ApproximateTime + message_filters) | 2.9-3.0ms | +1.3ms proc, but fixes RGB freshness & jitter | **active** |
 
 ### Breakdown rev 8 — C++ CUDA (frozen warp)
 
@@ -278,15 +279,54 @@ catch-up frames.
 
 This is upstream of the fusion node — no amount of kernel optimization can fix it.
 
-**Possible mitigations:**
-- Decouple from ApproximateTime sync — use latest-available RGB with each IR pair
-- Reduce sync_slop to drop stale triplets faster (but loses frames)
-- Pin USB interrupts to dedicated cores
-- Use hardware-sync'd cameras (e.g. RealSense multi-cam sync cable)
+**Resolution:** Rev 9 replaced ApproximateTime with event-driven 3-topic sync,
+eliminating jitter (peak ~50ms, down from 280-343ms) while maintaining 95-100%
+RGB freshness.
+
+### Rev 9 — event-driven 3-topic sync
+
+Replaced `message_filters::ApproximateTime` IR1+IR2 sync + decoupled RGB with CV wait
+with a fully event-driven approach: three plain subscriptions on a single
+`MutuallyExclusive` callback group, no mutex, no blocking waits.
+
+**How it works:**
+- All three callbacks (IR1, IR2, RGB) store their latest message and call `try_fuse()`
+- `try_fuse()` checks if IR1 and RGB timestamps are within 5ms — if so, fuses immediately
+- Whichever topic arrives LAST triggers fusion (no thread coordination needed)
+- 5ms one-shot timer fires as fallback if RGB never matches (fuses with stale)
+
+**Why it works:** The bag's dominant message order is `IR2 → IR1 → RGB` (77%).
+With sequential callback processing, RGB callback fires ~1ms after IR1 and
+triggers fusion. For the 18% where RGB arrives before IR1, the IR1 callback
+finds fresh RGB immediately. This mirrors the prototype's peek-ahead logic
+but handles all arrival permutations (the prototype misses `IR1 → IR2 → RGB`).
+
+**Results:**
+```
+30 fps | interval avg 33.3ms peak ~50ms | proc avg 2.9-3.0ms peak 5-6ms
+rgb age avg 0.0ms peak 0.0ms fresh 100%  (typical)
+rgb age avg 1.7ms peak 33.7ms fresh 95%  (worst 2s window during high motion)
+```
+
+**Comparison across sync strategies:**
+
+| Strategy | Interval peak | Proc avg | RGB fresh | Notes |
+|----------|--------------|----------|-----------|-------|
+| 3-way ApproximateTime (rev 8) | 280-343ms | 1.6ms | 100% | Jitter from sync holding frames |
+| 2-way IR sync + CV wait 5ms | ~48ms | 3.9ms | 47-83% | Jitter fixed but RGB unreliable |
+| Event-driven (rev 9) | ~50ms | 2.9ms | 95-100% | Best of both worlds |
+
+Proc time is higher than rev 8's 1.6ms because rev 8 measured only the fusion
+pipeline (sync callback), while rev 9 includes the event-driven overhead of
+checking freshness after each callback. The actual GPU work is identical.
+
+**Removed dependencies:** `message_filters` (CMakeLists.txt, package.xml).
+
+---
 
 ## Ideas backlog
 
 - **Zero-copy DDS** (Cyclone DDS + iceoryx shared memory) — eliminate the final memcpy + serialize
 - **Keep RGB on GPU** if source can deliver it there directly (e.g. nvdec)
 - **CUDA graph capture** — record the kernel launch pattern once, replay with near-zero CPU overhead
-- **Decouple RGB sync** — use latest RGB instead of ApproximateTime to eliminate 300ms jitter spikes
+- ~~**Decouple RGB sync**~~ — done (rev 9, event-driven 3-topic sync)

@@ -1,9 +1,8 @@
 #include <array>
 #include <chrono>
-#include <condition_variable>
+#include <cmath>
 #include <cstring>
 #include <deque>
-#include <mutex>
 #include <string>
 #include <vector>
 
@@ -11,16 +10,12 @@
 #include <opencv2/imgproc.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
-#include <message_filters/subscriber.h>
-#include <message_filters/sync_policies/approximate_time.h>
-#include <message_filters/synchronizer.h>
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
 
 #include "ir_rgb_fusion_cuda/cuda_check.hpp"
 #include "ir_rgb_fusion_cuda/fusion_pipeline.hpp"
 
 using sensor_msgs::msg::Image;
-using SyncPolicy = message_filters::sync_policies::ApproximateTime<Image, Image>;
 
 class FusionNode : public rclcpp::Node {
 public:
@@ -61,19 +56,20 @@ private:
     std::unique_ptr<FusionPipeline> pipeline_left_;
     std::unique_ptr<FusionPipeline> pipeline_right_;
 
-    // ROS
-    std::shared_ptr<message_filters::Subscriber<Image>> sub_infra1_;
-    std::shared_ptr<message_filters::Subscriber<Image>> sub_infra2_;
-    std::shared_ptr<message_filters::Synchronizer<SyncPolicy>> sync_;
+    // ROS — event-driven 3-topic sync
+    // All frame callbacks share one MutuallyExclusive group so they
+    // execute sequentially in DDS arrival order.  No mutex needed.
+    rclcpp::CallbackGroup::SharedPtr frame_cbg_;
+    rclcpp::Subscription<Image>::SharedPtr sub_ir1_;
+    rclcpp::Subscription<Image>::SharedPtr sub_ir2_;
     rclcpp::Subscription<Image>::SharedPtr sub_color_;
-    rclcpp::CallbackGroup::SharedPtr rgb_cbg_;
+    rclcpp::TimerBase::SharedPtr stale_timer_;
     rclcpp::Publisher<Image>::SharedPtr pub_left_;
     rclcpp::Publisher<Image>::SharedPtr pub_right_;
 
-    // Latest RGB frame (written by rgb_callback, read by sync_callback)
-    std::mutex rgb_mutex_;
-    std::condition_variable rgb_cv_;
-    Image::ConstSharedPtr latest_rgb_;
+    // Frame state (only touched from frame_cbg_ callbacks)
+    Image::ConstSharedPtr latest_ir1_, latest_ir2_, latest_rgb_;
+    bool ir1_pending_ = false;
 
     // Pre-allocated output messages
     Image msg_left_, msg_right_;
@@ -101,7 +97,7 @@ private:
         declare_parameter("color_topic", "/camera/color/image_raw");
         declare_parameter("fused_left_topic", "/camera/fused/left");
         declare_parameter("fused_right_topic", "/camera/fused/right");
-        declare_parameter("sync_slop", 0.02);
+        declare_parameter("sync_slop", 0.005);
         declare_parameter("orb_features", 1000);
         declare_parameter("ema_alpha", 0.2);
 
@@ -146,28 +142,32 @@ private:
     }
 
     void init_ros() {
-        sub_infra1_ = std::make_shared<message_filters::Subscriber<Image>>(
-            this, infra1_topic_);
-        sub_infra2_ = std::make_shared<message_filters::Subscriber<Image>>(
-            this, infra2_topic_);
-
-        // IR pair sync only — RGB decoupled for peek-ahead
-        sync_ = std::make_shared<message_filters::Synchronizer<SyncPolicy>>(
-            SyncPolicy(10), *sub_infra1_, *sub_infra2_);
-        sync_->setMaxIntervalDuration(rclcpp::Duration::from_seconds(sync_slop_));
-        sync_->registerCallback(
-            std::bind(&FusionNode::sync_callback, this,
-                      std::placeholders::_1, std::placeholders::_2));
-
-        // RGB in its own callback group so it can fire during the 2ms wait
-        rgb_cbg_ = create_callback_group(
+        // All frame callbacks on one MutuallyExclusive group —
+        // sequential processing, no mutex needed for frame state.
+        frame_cbg_ = create_callback_group(
             rclcpp::CallbackGroupType::MutuallyExclusive);
-        rclcpp::SubscriptionOptions rgb_opts;
-        rgb_opts.callback_group = rgb_cbg_;
+        rclcpp::SubscriptionOptions opts;
+        opts.callback_group = frame_cbg_;
+
+        sub_ir1_ = create_subscription<Image>(
+            infra1_topic_, rclcpp::QoS(10),
+            [this](Image::ConstSharedPtr msg) { ir1_callback(std::move(msg)); },
+            opts);
+        sub_ir2_ = create_subscription<Image>(
+            infra2_topic_, rclcpp::QoS(10),
+            [this](Image::ConstSharedPtr msg) { ir2_callback(std::move(msg)); },
+            opts);
         sub_color_ = create_subscription<Image>(
             color_topic_, rclcpp::QoS(10),
-            std::bind(&FusionNode::rgb_callback, this, std::placeholders::_1),
-            rgb_opts);
+            [this](Image::ConstSharedPtr msg) { rgb_callback(std::move(msg)); },
+            opts);
+
+        // 5ms one-shot timer for stale-RGB fallback (initially cancelled)
+        stale_timer_ = create_wall_timer(
+            std::chrono::milliseconds(static_cast<int>(sync_slop_ * 1000)),
+            [this]() { stale_timeout(); },
+            frame_cbg_);
+        stale_timer_->cancel();
 
         pub_left_ = create_publisher<Image>(fused_left_topic_, 10);
         pub_right_ = create_publisher<Image>(fused_right_topic_, 10);
@@ -179,12 +179,54 @@ private:
             });
     }
 
-    void rgb_callback(Image::ConstSharedPtr msg) {
-        {
-            std::lock_guard<std::mutex> lock(rgb_mutex_);
-            latest_rgb_ = std::move(msg);
+    // ---------------------------------------------------------------
+    // Event-driven frame sync
+    //
+    // Each callback stores its message and checks whether a complete
+    // matched frame is ready.  Whichever topic arrives LAST triggers
+    // fusion — no blocking waits, no thread coordination.
+    // ---------------------------------------------------------------
+
+    void ir1_callback(Image::ConstSharedPtr msg) {
+        latest_ir1_ = std::move(msg);
+        ir1_pending_ = true;
+        if (!try_fuse()) {
+            stale_timer_->reset();  // wait up to 5ms for fresh RGB
         }
-        rgb_cv_.notify_one();
+    }
+
+    void ir2_callback(Image::ConstSharedPtr msg) {
+        latest_ir2_ = std::move(msg);
+        if (ir1_pending_) try_fuse();
+    }
+
+    void rgb_callback(Image::ConstSharedPtr msg) {
+        latest_rgb_ = std::move(msg);
+        if (ir1_pending_) try_fuse();
+    }
+
+    void stale_timeout() {
+        stale_timer_->cancel();
+        if (!ir1_pending_) return;
+        ir1_pending_ = false;
+        if (latest_ir1_ && latest_ir2_ && latest_rgb_) {
+            do_fusion(false);
+        }
+    }
+
+    bool try_fuse() {
+        if (!latest_ir1_ || !latest_ir2_ || !latest_rgb_) return false;
+
+        auto ir_stamp = rclcpp::Time(latest_ir1_->header.stamp);
+        auto rgb_stamp = rclcpp::Time(latest_rgb_->header.stamp);
+        double age = std::abs((ir_stamp - rgb_stamp).seconds());
+
+        if (age > sync_slop_) return false;  // RGB not from same frame
+
+        ir1_pending_ = false;
+        stale_timer_->cancel();
+        do_fusion(true);
+        return true;
     }
 
     // ---------------------------------------------------------------
@@ -242,41 +284,23 @@ private:
     }
 
     // ---------------------------------------------------------------
-    void sync_callback(
-        const Image::ConstSharedPtr& infra1_msg,
-        const Image::ConstSharedPtr& infra2_msg)
-    {
-        auto t0 = std::chrono::steady_clock::now();
+    void do_fusion(bool rgb_fresh) {
+        auto t0 = SteadyClock::now();
 
-        // Peek-ahead: wait up to 2ms for fresh RGB if current is stale
-        Image::ConstSharedPtr color_msg;
+        const auto& infra1_msg = latest_ir1_;
+        const auto& infra2_msg = latest_ir2_;
+        const auto& color_msg = latest_rgb_;
+
+        // RGB age stats
         {
-            std::unique_lock<std::mutex> lock(rgb_mutex_);
-            rclcpp::Time ir_stamp(infra1_msg->header.stamp);
-
-            auto is_fresh = [&]() -> bool {
-                if (!latest_rgb_) return false;
-                double age = (ir_stamp -
-                    rclcpp::Time(latest_rgb_->header.stamp)).seconds();
-                return age < 0.005; // RGB within 5ms of IR
-            };
-
-            if (!is_fresh()) {
-                rgb_cv_.wait_for(lock, std::chrono::milliseconds(5), is_fresh);
-            }
-            color_msg = latest_rgb_;
-
-            if (color_msg) {
-                double age_ms = (ir_stamp -
-                    rclcpp::Time(color_msg->header.stamp)).seconds() * 1000.0;
-                rgb_age_sum_ += age_ms;
-                if (age_ms > rgb_age_peak_) rgb_age_peak_ = age_ms;
-                rgb_age_count_++;
-                if (is_fresh()) rgb_fresh_count_++;
-            }
+            auto ir_stamp = rclcpp::Time(infra1_msg->header.stamp);
+            double age_ms = (ir_stamp -
+                rclcpp::Time(color_msg->header.stamp)).seconds() * 1000.0;
+            rgb_age_sum_ += age_ms;
+            if (age_ms > rgb_age_peak_) rgb_age_peak_ = age_ms;
+            rgb_age_count_++;
+            if (rgb_fresh) rgb_fresh_count_++;
         }
-
-        if (!color_msg) return; // No RGB yet
 
         // Decode images — zero-copy cv::Mat wrappers over msg data
         int ir_h = infra1_msg->height, ir_w = infra1_msg->width;
@@ -305,8 +329,6 @@ private:
             rgb_w = ir_w;
         }
 
-        auto t1 = std::chrono::steady_clock::now();
-
         // Upload RGB to GPU on stream_left, record event for stream_right
         ensure_rgb_buffer(rgb_h, rgb_w);
         size_t rgb_bytes = static_cast<size_t>(rgb_h) * rgb_w * 3;
@@ -314,8 +336,6 @@ private:
                                    cudaMemcpyHostToDevice, stream_left_));
         CUDA_CHECK(cudaEventRecord(rgb_uploaded_, stream_left_));
         CUDA_CHECK(cudaStreamWaitEvent(stream_right_, rgb_uploaded_, 0));
-
-        auto t2 = std::chrono::steady_clock::now();
 
         // Submit warp for both eyes (shares one rgb_gray conversion)
         cv::Mat rgb_gray;
@@ -338,8 +358,6 @@ private:
             d_rgb_, rgb_h, rgb_w, ir_right, ir_h, ir_w,
             stream_right_, right_h, right_w);
 
-        auto t3 = std::chrono::steady_clock::now();
-
         // Download left + publish
         if (left_ok) {
             prepare_msg(msg_left_, left_h, left_w, infra1_msg->header);
@@ -349,8 +367,6 @@ private:
             FusionPipeline::gray_to_rgb(ir_left, ir_h, ir_w, msg_left_.data.data());
         }
         pub_left_->publish(msg_left_);
-
-        auto t4 = std::chrono::steady_clock::now();
 
         // Download right + publish
         if (right_ok) {
@@ -362,7 +378,7 @@ private:
         }
         pub_right_->publish(msg_right_);
 
-        auto t5 = std::chrono::steady_clock::now();
+        auto t5 = SteadyClock::now();
 
         // Rolling stats
         auto ms = [](auto a, auto b) {
