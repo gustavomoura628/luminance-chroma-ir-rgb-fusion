@@ -1,0 +1,322 @@
+#include <array>
+#include <chrono>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include <cuda_runtime.h>
+#include <opencv2/imgproc.hpp>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/image.hpp>
+#include <message_filters/subscriber.h>
+#include <message_filters/sync_policies/approximate_time.h>
+#include <message_filters/synchronizer.h>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
+
+#include "ir_rgb_fusion_cuda/cuda_check.hpp"
+#include "ir_rgb_fusion_cuda/fusion_pipeline.hpp"
+
+using sensor_msgs::msg::Image;
+using SyncPolicy = message_filters::sync_policies::ApproximateTime<Image, Image, Image>;
+
+class FusionNode : public rclcpp::Node {
+public:
+    FusionNode() : Node("fusion_node") {
+        declare_params();
+        read_params();
+        init_cuda();
+        init_pipelines();
+        init_ros();
+
+        RCLCPP_INFO(get_logger(),
+            "Fusion node started — subscribing to %s, %s, %s",
+            infra1_topic_.c_str(), infra2_topic_.c_str(), color_topic_.c_str());
+    }
+
+    ~FusionNode() override {
+        // Free CUDA resources before context teardown
+        if (d_rgb_) cudaFree(d_rgb_);
+        if (stream_left_) cudaStreamDestroy(stream_left_);
+        if (stream_right_) cudaStreamDestroy(stream_right_);
+        if (rgb_uploaded_) cudaEventDestroy(rgb_uploaded_);
+    }
+
+private:
+    // Parameters
+    std::string infra1_topic_, infra2_topic_, color_topic_;
+    std::string fused_left_topic_, fused_right_topic_;
+    double sync_slop_;
+
+    // CUDA resources
+    cudaStream_t stream_left_ = nullptr;
+    cudaStream_t stream_right_ = nullptr;
+    cudaEvent_t rgb_uploaded_ = nullptr;
+    uint8_t* d_rgb_ = nullptr;
+    int rgb_buf_h_ = 0, rgb_buf_w_ = 0;
+
+    // Pipelines
+    std::unique_ptr<FusionPipeline> pipeline_left_;
+    std::unique_ptr<FusionPipeline> pipeline_right_;
+
+    // ROS
+    std::shared_ptr<message_filters::Subscriber<Image>> sub_infra1_;
+    std::shared_ptr<message_filters::Subscriber<Image>> sub_infra2_;
+    std::shared_ptr<message_filters::Subscriber<Image>> sub_color_;
+    std::shared_ptr<message_filters::Synchronizer<SyncPolicy>> sync_;
+    rclcpp::Publisher<Image>::SharedPtr pub_left_;
+    rclcpp::Publisher<Image>::SharedPtr pub_right_;
+
+    // Pre-allocated output messages
+    Image msg_left_, msg_right_;
+
+    // Parameter callback handle (prevent GC)
+    rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_;
+
+    // ---------------------------------------------------------------
+    void declare_params() {
+        declare_parameter("infra1_topic", "/camera/infra1/image_rect_raw");
+        declare_parameter("infra2_topic", "/camera/infra2/image_rect_raw");
+        declare_parameter("color_topic", "/camera/color/image_raw");
+        declare_parameter("fused_left_topic", "/camera/fused/left");
+        declare_parameter("fused_right_topic", "/camera/fused/right");
+        declare_parameter("sync_slop", 0.02);
+        declare_parameter("orb_features", 1000);
+        declare_parameter("ema_alpha", 0.2);
+
+        rcl_interfaces::msg::ParameterDescriptor freeze_desc;
+        freeze_desc.description = "Warp freeze mode: \"auto\", \"on\", or \"off\"";
+        declare_parameter("freeze_mode", "auto", freeze_desc);
+
+        rcl_interfaces::msg::ParameterDescriptor freeze_after_desc;
+        freeze_after_desc.description = "Seconds of EMA before auto-freezing (auto mode only)";
+        declare_parameter("freeze_after", 5.0, freeze_after_desc);
+
+        rcl_interfaces::msg::ParameterDescriptor crop_desc;
+        crop_desc.description = "Crop to valid overlap region (true) or full IR frame (false)";
+        declare_parameter("crop", false, crop_desc);
+    }
+
+    void read_params() {
+        infra1_topic_ = get_parameter("infra1_topic").as_string();
+        infra2_topic_ = get_parameter("infra2_topic").as_string();
+        color_topic_ = get_parameter("color_topic").as_string();
+        fused_left_topic_ = get_parameter("fused_left_topic").as_string();
+        fused_right_topic_ = get_parameter("fused_right_topic").as_string();
+        sync_slop_ = get_parameter("sync_slop").as_double();
+    }
+
+    void init_cuda() {
+        CUDA_CHECK(cudaStreamCreate(&stream_left_));
+        CUDA_CHECK(cudaStreamCreate(&stream_right_));
+        CUDA_CHECK(cudaEventCreateWithFlags(&rgb_uploaded_, cudaEventDisableTiming));
+    }
+
+    void init_pipelines() {
+        FusionPipeline::Params p;
+        p.orb_features = get_parameter("orb_features").as_int();
+        p.ema_alpha = static_cast<float>(get_parameter("ema_alpha").as_double());
+        p.freeze_mode = get_parameter("freeze_mode").as_string();
+        p.freeze_after = static_cast<float>(get_parameter("freeze_after").as_double());
+        p.crop = get_parameter("crop").as_bool();
+
+        pipeline_left_ = std::make_unique<FusionPipeline>(p);
+        pipeline_right_ = std::make_unique<FusionPipeline>(p);
+    }
+
+    void init_ros() {
+        sub_infra1_ = std::make_shared<message_filters::Subscriber<Image>>(
+            this, infra1_topic_);
+        sub_infra2_ = std::make_shared<message_filters::Subscriber<Image>>(
+            this, infra2_topic_);
+        sub_color_ = std::make_shared<message_filters::Subscriber<Image>>(
+            this, color_topic_);
+
+        sync_ = std::make_shared<message_filters::Synchronizer<SyncPolicy>>(
+            SyncPolicy(10), *sub_infra1_, *sub_infra2_, *sub_color_);
+        sync_->setMaxIntervalDuration(rclcpp::Duration::from_seconds(sync_slop_));
+        sync_->registerCallback(
+            std::bind(&FusionNode::sync_callback, this,
+                      std::placeholders::_1, std::placeholders::_2,
+                      std::placeholders::_3));
+
+        pub_left_ = create_publisher<Image>(fused_left_topic_, 10);
+        pub_right_ = create_publisher<Image>(fused_right_topic_, 10);
+
+        // Dynamic parameter callback
+        param_cb_ = add_on_set_parameters_callback(
+            [this](const std::vector<rclcpp::Parameter>& params) {
+                return on_param_change(params);
+            });
+    }
+
+    // ---------------------------------------------------------------
+    rcl_interfaces::msg::SetParametersResult on_param_change(
+        const std::vector<rclcpp::Parameter>& params)
+    {
+        rcl_interfaces::msg::SetParametersResult result;
+        result.successful = true;
+
+        for (const auto& p : params) {
+            if (p.get_name() == "freeze_mode") {
+                auto v = p.as_string();
+                if (v != "auto" && v != "on" && v != "off") {
+                    result.successful = false;
+                    result.reason = "Invalid freeze_mode: \"" + v + "\"";
+                    return result;
+                }
+                pipeline_left_->set_freeze_mode(v);
+                pipeline_right_->set_freeze_mode(v);
+                RCLCPP_INFO(get_logger(), "freeze_mode -> %s", v.c_str());
+            } else if (p.get_name() == "freeze_after") {
+                auto v = static_cast<float>(p.as_double());
+                pipeline_left_->set_freeze_after(v);
+                pipeline_right_->set_freeze_after(v);
+                RCLCPP_INFO(get_logger(), "freeze_after -> %.1f", v);
+            } else if (p.get_name() == "crop") {
+                pipeline_left_->set_crop(p.as_bool());
+                pipeline_right_->set_crop(p.as_bool());
+                RCLCPP_INFO(get_logger(), "crop -> %s", p.as_bool() ? "true" : "false");
+            }
+        }
+        return result;
+    }
+
+    // ---------------------------------------------------------------
+    void ensure_rgb_buffer(int h, int w) {
+        if (h == rgb_buf_h_ && w == rgb_buf_w_) return;
+        if (d_rgb_) cudaFree(d_rgb_);
+        size_t bytes = static_cast<size_t>(h) * w * 3;
+        CUDA_CHECK(cudaMalloc(&d_rgb_, bytes));
+        rgb_buf_h_ = h;
+        rgb_buf_w_ = w;
+    }
+
+    void prepare_msg(Image& msg, int h, int w,
+                     const std_msgs::msg::Header& header) {
+        msg.header = header;
+        msg.height = h;
+        msg.width = w;
+        msg.encoding = "rgb8";
+        msg.step = w * 3;
+        msg.is_bigendian = false;
+        size_t bytes = static_cast<size_t>(h) * w * 3;
+        if (msg.data.size() != bytes) msg.data.resize(bytes);
+    }
+
+    // ---------------------------------------------------------------
+    void sync_callback(
+        const Image::ConstSharedPtr& infra1_msg,
+        const Image::ConstSharedPtr& infra2_msg,
+        const Image::ConstSharedPtr& color_msg)
+    {
+        auto t0 = std::chrono::steady_clock::now();
+
+        // Decode images — zero-copy cv::Mat wrappers over msg data
+        int ir_h = infra1_msg->height, ir_w = infra1_msg->width;
+        const uint8_t* ir_left = infra1_msg->data.data();
+        const uint8_t* ir_right = infra2_msg->data.data();
+
+        int rgb_h = color_msg->height, rgb_w = color_msg->width;
+        cv::Mat rgb_mat(rgb_h, rgb_w, CV_8UC3,
+                        const_cast<uint8_t*>(color_msg->data.data()));
+
+        // BGR → RGB if needed
+        bool is_bgr = (color_msg->encoding == "bgr8");
+        cv::Mat rgb_work;
+        if (is_bgr) {
+            cv::cvtColor(rgb_mat, rgb_work, cv::COLOR_BGR2RGB);
+        } else {
+            rgb_work = rgb_mat;
+        }
+
+        // Resize RGB to match IR if needed
+        if (rgb_h != ir_h || rgb_w != ir_w) {
+            cv::Mat resized;
+            cv::resize(rgb_work, resized, cv::Size(ir_w, ir_h));
+            rgb_work = resized;
+            rgb_h = ir_h;
+            rgb_w = ir_w;
+        }
+
+        auto t1 = std::chrono::steady_clock::now();
+
+        // Upload RGB to GPU on stream_left, record event for stream_right
+        ensure_rgb_buffer(rgb_h, rgb_w);
+        size_t rgb_bytes = static_cast<size_t>(rgb_h) * rgb_w * 3;
+        CUDA_CHECK(cudaMemcpyAsync(d_rgb_, rgb_work.data, rgb_bytes,
+                                   cudaMemcpyHostToDevice, stream_left_));
+        CUDA_CHECK(cudaEventRecord(rgb_uploaded_, stream_left_));
+        CUDA_CHECK(cudaStreamWaitEvent(stream_right_, rgb_uploaded_, 0));
+
+        auto t2 = std::chrono::steady_clock::now();
+
+        // Submit warp for both eyes (shares one rgb_gray conversion)
+        cv::Mat rgb_gray;
+        cv::cvtColor(rgb_work, rgb_gray, cv::COLOR_RGB2GRAY);
+
+        cv::Mat ir_left_mat(ir_h, ir_w, CV_8UC1, const_cast<uint8_t*>(ir_left));
+        cv::Mat ir_right_mat(ir_h, ir_w, CV_8UC1, const_cast<uint8_t*>(ir_right));
+
+        pipeline_left_->submit_warp(rgb_gray, ir_left_mat);
+        pipeline_right_->submit_warp(rgb_gray, ir_right_mat);
+
+        // Launch both eyes async — overlapped on GPU
+        int left_h = 0, left_w = 0;
+        bool left_ok = pipeline_left_->launch_async(
+            d_rgb_, rgb_h, rgb_w, ir_left, ir_h, ir_w,
+            stream_left_, left_h, left_w);
+
+        int right_h = 0, right_w = 0;
+        bool right_ok = pipeline_right_->launch_async(
+            d_rgb_, rgb_h, rgb_w, ir_right, ir_h, ir_w,
+            stream_right_, right_h, right_w);
+
+        auto t3 = std::chrono::steady_clock::now();
+
+        // Download left + publish
+        if (left_ok) {
+            prepare_msg(msg_left_, left_h, left_w, infra1_msg->header);
+            pipeline_left_->download_sync(msg_left_.data.data(), stream_left_);
+        } else {
+            prepare_msg(msg_left_, ir_h, ir_w, infra1_msg->header);
+            FusionPipeline::gray_to_rgb(ir_left, ir_h, ir_w, msg_left_.data.data());
+        }
+        pub_left_->publish(msg_left_);
+
+        auto t4 = std::chrono::steady_clock::now();
+
+        // Download right + publish
+        if (right_ok) {
+            prepare_msg(msg_right_, right_h, right_w, infra2_msg->header);
+            pipeline_right_->download_sync(msg_right_.data.data(), stream_right_);
+        } else {
+            prepare_msg(msg_right_, ir_h, ir_w, infra2_msg->header);
+            FusionPipeline::gray_to_rgb(ir_right, ir_h, ir_w, msg_right_.data.data());
+        }
+        pub_right_->publish(msg_right_);
+
+        auto t5 = std::chrono::steady_clock::now();
+
+        // Timing log (throttled to ~1Hz)
+        static auto last_log = std::chrono::steady_clock::now();
+        if (t5 - last_log > std::chrono::seconds(1)) {
+            last_log = t5;
+            auto ms = [](auto a, auto b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            RCLCPP_INFO(get_logger(),
+                "%.1fms/frame | decode=%.1f rgb_up=%.1f "
+                "launch=%.1f L_sync+pub=%.1f R_sync+pub=%.1f",
+                ms(t0, t5), ms(t0, t1), ms(t1, t2),
+                ms(t2, t3), ms(t3, t4), ms(t4, t5));
+        }
+    }
+};
+
+int main(int argc, char** argv) {
+    rclcpp::init(argc, argv);
+    auto node = std::make_shared<FusionNode>();
+    rclcpp::spin(node);
+    rclcpp::shutdown();
+    return 0;
+}

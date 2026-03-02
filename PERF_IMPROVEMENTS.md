@@ -195,8 +195,56 @@ operations and loaned DDS messages from Python.
 
 This is a different project, not an incremental optimization.
 
-## Ideas backlog (Python, diminishing returns)
+---
 
-- **CUDA streams** — overlap upload/compute/download across frames
-- **Fold zoom into grid** — build grid at output resolution so grid_sample does warp+zoom in one shot
-- **Keep RGB on GPU** if source can deliver it there directly (e.g. nvdec for rosbag)
+## C++ CUDA rewrite (ir_rgb_fusion_cuda)
+
+Baseline: C++ ROS2 node, fused CUDA kernel, no PyTorch/LibTorch, stereo 640x480/eye, frozen warp, rosbag source.
+
+### What changed
+
+Rewrote the entire pipeline as a C++ node (`cpp/` directory) with:
+- **Fused CUDA kernel** — single kernel does inverse affine warp, bilinear RGB sampling, 3x3 color matrix multiply, IR luma addition, clamp, and uint8 output. Replaces the PyTorch chain of `grid_sample` → `mm` → `clamp_` → `copy_` → `permute` → `copy_`.
+- **No PyTorch/LibTorch** — raw CUDA API, zero allocator overhead.
+- **Two CUDA streams** (L/R) with `cudaEventRecord`/`cudaStreamWaitEvent` for shared RGB upload — both eyes overlap on GPU.
+- **Pinned host buffers** for all transfers (`cudaMallocHost`), DMA download via `cudaMemcpyAsync`.
+- **2D async memcpy** for IR crop — uploads only the ROI, handles non-contiguous stride.
+- **Direct msg data access** — no cv_bridge, no intermediate copies. `sensor_msgs::msg::Image::data.data()` pointers used directly.
+- **Pre-allocated output messages** — `Image` objects reused across frames.
+
+### Results
+
+| # | Change | Typical frame | Delta | Status |
+|---|--------|---------------|-------|--------|
+| 8 | C++ CUDA rewrite | 1.4-1.8ms | **-2.3ms** | **active** |
+
+### Breakdown rev 8 — C++ CUDA (frozen warp)
+
+```
+decode:       0.0ms     (zero-copy cv::Mat over msg data)
+rgb_up:       0.2ms     (cudaMemcpyAsync to pre-alloc device buf + event record)
+launch:       0.4-0.6ms (submit_warp + launch_async L + launch_async R)
+  IR upload:  ~0.1ms    (cudaMemcpy2DAsync, ROI only)
+  kernel:     ~0.05ms   (fused warp+color+luma, 16x16 blocks)
+  download:   ~0.1ms    (cudaMemcpyAsync to pinned host)
+L_sync+pub:   0.4-0.5ms (cudaStreamSynchronize + memcpy + DDS publish)
+R_sync+pub:   0.3-0.4ms
+
+total:        1.4-1.8ms typical, best 1.2ms, spikes to 2.4ms
+```
+
+### What the rewrite eliminated
+
+| Overhead | Python cost | C++ cost |
+|----------|------------|----------|
+| PyTorch allocator (per-frame temp tensors) | ~0.3ms | 0 (pre-alloc) |
+| `from_numpy` → `.to(cuda)` → `.permute` → `.float()` | ~0.6ms | 0 (direct upload) |
+| `grid_sample` + `mm` + `clamp_` + cast + `permute` + download | ~1.0ms | ~0.15ms (single kernel) |
+| Python GIL / interpreter overhead | ~0.1ms | 0 |
+| rclpy CDR serialize vs rclcpp | ~0.3ms | ~0.2ms |
+
+## Ideas backlog
+
+- **Zero-copy DDS** (Cyclone DDS + iceoryx shared memory) — eliminate the final memcpy + serialize
+- **Keep RGB on GPU** if source can deliver it there directly (e.g. nvdec)
+- **CUDA graph capture** — record the kernel launch pattern once, replay with near-zero CPU overhead
