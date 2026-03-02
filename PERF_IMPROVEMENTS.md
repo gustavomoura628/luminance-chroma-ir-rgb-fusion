@@ -324,9 +324,61 @@ checking freshness after each callback. The actual GPU work is identical.
 
 ---
 
+## DDS transport layer
+
+### Problem
+
+All subscribers (Lichtblick, rqt_image_view, custom SDL2 viewer) drop frames on large
+rgb8 messages (~900KB at 640x480x3) while small mono8 messages (~300KB) arrive at a
+solid 30fps. The bag itself is clean — only 4 gaps >50ms in 4685 RGB frames over 170s.
+The drops are purely in DDS transport.
+
+Observed pattern: 22-28fps instead of 30fps, with interval peaks at multiples of 33ms
+(67/100/133/167ms = 1-4 dropped frames). Affects ALL viewers identically.
+
+### Environment
+
+- RMW: `rmw_fastrtps_cpp` (eProsima Fast DDS)
+- Transport: UDP loopback (same machine, bag playback → fusion node → viewer)
+- `net.core.rmem_max` was 212992 (208KB) — smaller than a single rgb8 message
+
+### What we tried
+
+| Change | Result |
+|--------|--------|
+| Increase `net.core.rmem_max` to 64MB | No change |
+| Disable vsync in viewer | No change |
+| Move ROS spin to background thread (viewer) | No change |
+| Swap-based mutex minimization (viewer) | No change |
+| Switch QoS from BEST_EFFORT to RELIABLE | No change |
+
+None of these helped because the bottleneck is FastDDS fragmenting large messages into
+UDP datagrams and losing fragments on loopback, requiring retransmission.
+
+### Options to investigate
+
+1. **FastDDS shared memory transport** — bypasses UDP entirely for same-machine comms.
+   Would fix the on-robot path (camera driver → fusion node) which is the critical one.
+   Won't help remote viewers (teleop workstation).
+2. **Switch to CycloneDDS** (`export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`) — handles
+   large messages better out of the box, ROS 2 Humble default.
+3. **FastDDS XML profile tuning** — increase send/receive buffer sizes, socket buffer
+   sizes, fragment sizes.
+4. **Reduce message size** — publish as a more compact format (e.g. YCbCr packed in
+   mono16, ~600KB instead of 900KB).
+5. **CycloneDDS + iceoryx shared memory** — zero-copy transport, eliminates serialize +
+   memcpy entirely. Best possible solution but most setup.
+
+For the actual robot deployment, option 1 or 5 is likely sufficient since the fusion
+node runs on the same machine as the camera driver. The remote viewer problem is
+separate and may need transport-level tuning or a dedicated video streaming path
+(e.g. H.264/H.265 over RTP) rather than raw DDS image transport.
+
+---
+
 ## Ideas backlog
 
-- **Zero-copy DDS** (Cyclone DDS + iceoryx shared memory) — eliminate the final memcpy + serialize
 - **Keep RGB on GPU** if source can deliver it there directly (e.g. nvdec)
 - **CUDA graph capture** — record the kernel launch pattern once, replay with near-zero CPU overhead
 - ~~**Decouple RGB sync**~~ — done (rev 9, event-driven 3-topic sync)
+- ~~**Zero-copy DDS**~~ — moved to DDS transport layer section
