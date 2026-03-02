@@ -113,6 +113,10 @@ class FusionNode(Node):
         self._pub_left = self.create_publisher(Image, fused_left_topic, 10)
         self._pub_right = self.create_publisher(Image, fused_right_topic, 10)
 
+        # Pre-allocated publish buffers and reusable message objects
+        self._pub_bufs: dict[str, tuple[array.array, np.ndarray]] = {}
+        self._pub_msgs: dict[str, Image] = {}
+
         self.get_logger().info(
             f"Fusion node started — subscribing to {infra1_topic}, "
             f"{infra2_topic}, {color_topic}"
@@ -173,30 +177,50 @@ class FusionNode(Node):
         t4 = _t()
 
         # Publish
-        self._pub_left.publish(self._make_img_msg(fused_left, infra1_msg.header))
+        msg_left = self._make_img_msg("left", fused_left, infra1_msg.header)
         t5 = _t()
-        self._pub_right.publish(self._make_img_msg(fused_right, infra2_msg.header))
+        self._pub_left.publish(msg_left)
         t6 = _t()
+        msg_right = self._make_img_msg("right", fused_right, infra2_msg.header)
+        t7 = _t()
+        self._pub_right.publish(msg_right)
+        t8 = _t()
 
         self.get_logger().info(
-            f"{_ms(t6 - t0)}ms/frame | "
+            f"{_ms(t8 - t0)}ms/frame | "
             f"decode={_ms(t1 - t0)} resize={_ms(t2 - t1)} "
             f"{_fmt_pipeline('L', t3 - t2, self._pipeline_left.timings)} "
             f"{_fmt_pipeline('R', t4 - t3, self._pipeline_right.timings)} "
-            f"pub_L={_ms(t5 - t4)} pub_R={_ms(t6 - t5)}",
+            f"msg_L={_ms(t5 - t4)} dds_L={_ms(t6 - t5)} "
+            f"msg_R={_ms(t7 - t6)} dds_R={_ms(t8 - t7)}",
             throttle_duration_sec=1.0,
         )
 
 
-    @staticmethod
-    def _make_img_msg(img: np.ndarray, header) -> Image:
-        msg = Image()
+    def _make_img_msg(self, key: str, img: np.ndarray, header) -> Image:
+        h, w = img.shape[:2]
+        size = img.size
+
+        # Reuse message object — avoid Python object creation overhead
+        msg = self._pub_msgs.get(key)
+        if msg is None or msg.height != h or msg.width != w:
+            msg = Image()
+            msg.height = h
+            msg.width = w
+            msg.encoding = "rgb8"
+            msg.step = w * 3
+            self._pub_msgs[key] = msg
         msg.header = header
-        msg.height, msg.width = img.shape[:2]
-        msg.encoding = "rgb8"
-        msg.step = msg.width * 3
-        # array.array skips rclpy's per-byte validation (126ms -> 0ms at 640x480)
-        msg.data = array.array("B", img.tobytes())
+
+        # Pre-allocated buffer: single memcpy instead of tobytes+array.array double-copy
+        entry = self._pub_bufs.get(key)
+        if entry is None or len(entry[0]) != size:
+            buf = array.array("B", bytes(size))
+            entry = (buf, np.frombuffer(buf, dtype=np.uint8))
+            self._pub_bufs[key] = entry
+        buf, np_view = entry
+        np.copyto(np_view, img.ravel())
+        msg.data = buf
         return msg
 
 

@@ -1,0 +1,106 @@
+# Performance Improvements
+
+## Prototype (stereo-gray-plus-rgb)
+
+Baseline: parallel stereo (both eyes), 640x480/eye, async warp, rosbag source, cv2.imshow display.
+
+### Results
+
+| # | Change | L total | R total | Avg | Delta | Status |
+|---|--------|---------|---------|-----|-------|--------|
+| 0 | Baseline (Lab color space) | 3.3ms | 3.1ms | 6.5ms | — | replaced |
+| 1 | YCrCb instead of Lab | 2.3ms | 2.0ms | 4.2ms | -2.3ms | carried forward |
+| 2 | Parallel eyes (Thread per frame) | 2.5ms | 3.3ms | 4.6ms | +0.4ms | reverted — thread spawn overhead + cache contention |
+| 3 | Parallel eyes (ThreadPoolExecutor) | 2.1ms | 2.8ms | 3.8ms | -0.4ms | replaced by GPU |
+| 4 | GPU warp+colorize (torch grid_sample) | — | — | 3.4ms | -0.4ms | carried forward |
+| 5 | Float16 color math (post grid_sample) | — | — | 3.5ms | ~0ms | no gain — color math is tiny vs data transfer |
+| 6 | Cache warp grid (skip rebuild if M unchanged) | — | — | 3.5ms | ~0ms | no gain — grid build is fast, transfer dominates |
+
+### Breakdown (prototype, frozen warp)
+
+```
+warp:      0.04ms   (skip — just returns cached M)
+upload:    0.64ms
+colorize:  2.10ms   (no ORB thread competing for GPU/CPU)
+download:  0.84ms
+total:     3.63ms
+```
+
+Key finding: bottleneck is CPU↔GPU data transfer (PCIe), not compute. At 640x480 the image
+is too small for GPU compute to overcome the transfer overhead.
+
+---
+
+## ROS2 package (luminance-chroma-ir-rgb-fusion)
+
+Baseline: ROS2 node, stereo (L+R eyes), 640x480/eye, frozen warp, rosbag source, publish rgb8.
+
+### Results
+
+| # | Change | Typical frame | Delta | Status |
+|---|--------|---------------|-------|--------|
+| 0 | Baseline (ROS2 node) | 5.5-6.5ms | — | replaced |
+| 1 | Pre-alloc publish buffers (single memcpy) | 5.5-6.2ms | ~-0.4ms | replaced |
+| 2 | Reuse Image msg object + split pub timing | 5.3-5.9ms | ~-0.2ms | **active** |
+
+### Breakdown rev 0 — baseline (frozen warp)
+
+```
+decode:    0.0ms    (frombuffer + reshape, essentially free)
+resize:    0.0ms    (no-op when IR and RGB are same resolution)
+
+L pipeline: 2.0-2.5ms
+  submit:  0.0ms    (frozen, just returns)
+  crop:    0.1ms    (compute_crop or skip)
+  to_gpu:  0.6ms    (from_numpy → .to(cuda) → permute → float — allocates every frame)
+  colorize: 0.7-0.9ms  (grid_sample + YCrCb color math, queued)
+  to_cpu:  0.5ms    (clamp → byte → permute → contiguous → .cpu() → .numpy(), GPU sync)
+
+R pipeline: 1.5-1.7ms
+  (same stages, faster — GPU warm, L's CUDA allocs cached)
+
+pub_L:     1.0-1.5ms   (tobytes + array.array + rclpy publish)
+pub_R:     0.8-1.3ms
+
+total:     5.5-6.5ms typical, 8-10ms spikes
+```
+
+### Breakdown rev 2 — pre-alloc buffers + reuse msg (frozen warp)
+
+```
+decode:    0.0ms
+resize:    0.0ms
+
+L pipeline: 1.9-2.3ms   (unchanged)
+R pipeline: 1.6-1.7ms   (unchanged)
+
+msg_L:     0.2ms        (np.copyto into pre-alloc buf + header assign, reused Image obj)
+dds_L:     0.7-0.8ms    (rclpy CDR serialize + DDS middleware write)
+msg_R:     0.2ms
+dds_R:     0.5-0.6ms
+
+total:     5.3-5.9ms typical
+```
+
+Publish split reveals: msg construction now ~0.4ms combined (down from ~1.0ms baseline).
+DDS calls are ~1.3ms combined — rclpy C-level serialize + middleware write, irreducible
+from Python without zero-copy transport (Cyclone DDS + iceoryx) or a C extension.
+
+Spikes (8-21ms) are correlated across ALL stages simultaneously — system-level contention
+(GC, scheduler, other processes), not a single bottleneck.
+
+### Top bottlenecks (target: <4ms)
+
+1. **to_gpu (~0.9ms combined)** — per-frame tensor allocation. Pinned pre-allocated buffers
+   would avoid malloc overhead and enable async DMA.
+2. **colorize (~1.4ms combined, spikes to 2-3ms)** — GPU queue time.
+3. **DDS publish (~1.3ms combined)** — rclpy C-level floor. Needs zero-copy transport or
+   C extension to improve.
+
+## Ideas backlog
+
+- **Pre-allocate pinned tensors** for upload/download — avoid per-frame allocation, enable async DMA
+- **CUDA streams** — overlap upload/compute/download across frames
+- **Zero-copy DDS** — Cyclone DDS + iceoryx shared memory, eliminates serialize copy
+- **Fold zoom into grid** — build grid at output resolution so grid_sample does warp+zoom in one shot
+- **Keep RGB on GPU** if source can deliver it there directly (e.g. nvdec for rosbag)
