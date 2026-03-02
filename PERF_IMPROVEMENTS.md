@@ -46,6 +46,7 @@ Baseline: ROS2 node, stereo (L+R eyes), 640x480/eye, frozen warp, rosbag source,
 | 4 | Shared RGB upload (node uploads once, both eyes reuse) | 4.5-5.1ms | ~-0.8ms | replaced |
 | 5 | Fuse color math into single matmul (3x3 @ warped) | 3.9-4.3ms | ~-0.4ms | replaced |
 | 6 | Pre-alloc pinned download + in-place clamp | 3.7-4.1ms | ~-0.2ms | **active** |
+| 7 | Pinned RGB upload buffer | 15-35ms | regression | reverted — copy_ from non-contiguous (permuted) pinned tensor is catastrophically slow |
 
 ### Breakdown rev 0 — baseline (frozen warp)
 
