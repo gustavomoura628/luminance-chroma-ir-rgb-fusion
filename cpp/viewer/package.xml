@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>ir_rgb_fusion_viewer</name>
+  <version>0.1.0</version>
+  <description>Low-latency stream viewer for IR/RGB fusion node output</description>
+  <maintainer email="gus@todo.todo">gus</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+
+  <build_depend>libsdl2-dev</build_depend>
+  <build_depend>libglew-dev</build_depend>
+
+  <exec_depend>libsdl2-2.0-0</exec_depend>
+  <exec_depend>libglew2.2</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
