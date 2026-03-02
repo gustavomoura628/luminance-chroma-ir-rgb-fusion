@@ -173,15 +173,30 @@ total:     3.7-4.1ms typical, best 3.7ms
 
 ### Top bottlenecks
 
-1. **rgb_up (~0.7ms)** — per-frame allocation. Pinned pre-allocated buffer would help.
+1. **rgb_up (~0.7ms)** — per-frame allocation. Pinned pre-allocated buffer would help,
+   BUT pinned + permute is catastrophically slow (rev 7). Would need contiguous NCHW
+   pinned buffer with a manual transpose, or skip the CPU entirely.
 2. **DDS publish (~1.1ms combined)** — rclpy C-level floor. Needs zero-copy transport or
    C extension to improve.
 3. **colorize (~1.8ms combined)** — mostly transfer time now, compute is minimal.
 
-## Ideas backlog
+### Python performance ceiling
 
-- **Pre-allocate pinned tensors** for upload/download — avoid per-frame allocation, enable async DMA
+At ~3.7-4.1ms we've hit the Python floor. All remaining time is spent at C boundaries:
+PCIe data transfer (rgb upload, IR upload, result download) and DDS serialization.
+Python itself adds negligible overhead — the bottleneck is inability to do zero-copy
+operations and loaned DDS messages from Python.
+
+**To go further, rewrite as a C++ ROS2 node with:**
+- CUDA interop (keep tensors on GPU, no numpy↔torch shuffling)
+- Loaned messages / zero-copy DDS (Cyclone DDS + iceoryx shared memory)
+- Direct GPU↔DDS path if subscriber supports it
+- CUDA streams to overlap upload/compute/download
+
+This is a different project, not an incremental optimization.
+
+## Ideas backlog (Python, diminishing returns)
+
 - **CUDA streams** — overlap upload/compute/download across frames
-- **Zero-copy DDS** — Cyclone DDS + iceoryx shared memory, eliminates serialize copy
 - **Fold zoom into grid** — build grid at output resolution so grid_sample does warp+zoom in one shot
 - **Keep RGB on GPU** if source can deliver it there directly (e.g. nvdec for rosbag)
