@@ -79,13 +79,17 @@ class FusionPipeline:
     # Public API
     # ------------------------------------------------------------------
 
-    def process(self, ir_gray: np.ndarray, rgb: np.ndarray) -> np.ndarray:
+    def process(
+        self, ir_gray: np.ndarray, rgb: np.ndarray, rgb_t: torch.Tensor | None = None,
+    ) -> np.ndarray:
         """Full pipeline: warp estimation -> GPU colorize -> RGB output.
 
         Parameters
         ----------
         ir_gray : (H, W) uint8 grayscale IR image.
         rgb : (H, W, 3) uint8 RGB color image.
+        rgb_t : optional (1, 3, H, W) float32 GPU tensor of rgb.
+            If provided, skips RGB upload (shared across pipelines).
 
         Returns
         -------
@@ -114,14 +118,15 @@ class FusionPipeline:
         # Full-frame mode: color where RGB covers, grayscale borders elsewhere
         roi = crop if self.crop else (0, 0, W, H)
 
-        # GPU colorize
-        rgb_t = (
-            torch.from_numpy(rgb)
-            .to(self._device)
-            .permute(2, 0, 1)
-            .unsqueeze(0)
-            .float()
-        )
+        # GPU colorize — skip RGB upload if caller provided it
+        if rgb_t is None:
+            rgb_t = (
+                torch.from_numpy(rgb)
+                .to(self._device)
+                .permute(2, 0, 1)
+                .unsqueeze(0)
+                .float()
+            )
         t3 = _t()
         result_t = self._gpu_colorize(rgb_t, ir_gray, M, roi, H, W)
         t4 = _t()

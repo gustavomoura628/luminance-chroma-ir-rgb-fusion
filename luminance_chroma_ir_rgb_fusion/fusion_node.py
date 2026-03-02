@@ -12,6 +12,7 @@ import time
 import cv2
 import numpy as np
 import rclpy
+import torch
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType, SetParametersResult
 from rclpy.node import Node
@@ -170,10 +171,20 @@ class FusionNode(Node):
             rgb = cv2.resize(rgb, (ir_w, ir_h))
         t2 = _t()
 
+        # Upload RGB to GPU once, shared across both pipelines
+        rgb_t = (
+            torch.from_numpy(rgb)
+            .to(self._pipeline_left._device)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .float()
+        )
+        t2b = _t()
+
         # Fuse both eyes
-        fused_left = self._pipeline_left.process(ir_left, rgb)
+        fused_left = self._pipeline_left.process(ir_left, rgb, rgb_t=rgb_t)
         t3 = _t()
-        fused_right = self._pipeline_right.process(ir_right, rgb)
+        fused_right = self._pipeline_right.process(ir_right, rgb, rgb_t=rgb_t)
         t4 = _t()
 
         # Publish
@@ -189,7 +200,8 @@ class FusionNode(Node):
         self.get_logger().info(
             f"{_ms(t8 - t0)}ms/frame | "
             f"decode={_ms(t1 - t0)} resize={_ms(t2 - t1)} "
-            f"{_fmt_pipeline('L', t3 - t2, self._pipeline_left.timings)} "
+            f"rgb_up={_ms(t2b - t2)} "
+            f"{_fmt_pipeline('L', t3 - t2b, self._pipeline_left.timings)} "
             f"{_fmt_pipeline('R', t4 - t3, self._pipeline_right.timings)} "
             f"msg_L={_ms(t5 - t4)} dds_L={_ms(t6 - t5)} "
             f"msg_R={_ms(t7 - t6)} dds_R={_ms(t8 - t7)}",

@@ -41,7 +41,9 @@ Baseline: ROS2 node, stereo (L+R eyes), 640x480/eye, frozen warp, rosbag source,
 |---|--------|---------------|-------|--------|
 | 0 | Baseline (ROS2 node) | 5.5-6.5ms | — | replaced |
 | 1 | Pre-alloc publish buffers (single memcpy) | 5.5-6.2ms | ~-0.4ms | replaced |
-| 2 | Reuse Image msg object + split pub timing | 5.3-5.9ms | ~-0.2ms | **active** |
+| 2 | Reuse Image msg object + split pub timing | 5.3-5.9ms | ~-0.2ms | replaced |
+| 3 | torch.set_num_threads(1) | 5.3-5.9ms | ~0ms | reverted — no effect on latency or CPU usage |
+| 4 | Shared RGB upload (node uploads once, both eyes reuse) | 4.5-5.1ms | ~-0.8ms | **active** |
 
 ### Breakdown rev 0 — baseline (frozen warp)
 
@@ -89,12 +91,41 @@ from Python without zero-copy transport (Cyclone DDS + iceoryx) or a C extension
 Spikes (8-21ms) are correlated across ALL stages simultaneously — system-level contention
 (GC, scheduler, other processes), not a single bottleneck.
 
+### Breakdown rev 4 — shared RGB upload (frozen warp)
+
+```
+decode:    0.0ms
+resize:    0.0ms
+rgb_up:    0.6-0.7ms   (single upload shared by both eyes)
+
+L pipeline: 1.5ms
+  submit:  0.0ms
+  crop:    0.1ms
+  to_gpu:  0.0ms       (reuses shared rgb_t)
+  colorize: 0.8ms
+  to_cpu:  0.5ms
+
+R pipeline: 1.2-1.3ms
+  to_gpu:  0.0ms       (reuses shared rgb_t)
+  colorize: 0.6ms
+  to_cpu:  0.6ms
+
+msg_L:     0.2ms
+dds_L:     0.4ms
+msg_R:     0.2ms
+dds_R:     0.3ms
+
+total:     4.5-5.1ms typical
+```
+
 ### Top bottlenecks (target: <4ms)
 
-1. **to_gpu (~0.9ms combined)** — per-frame tensor allocation. Pinned pre-allocated buffers
-   would avoid malloc overhead and enable async DMA.
-2. **colorize (~1.4ms combined, spikes to 2-3ms)** — GPU queue time.
-3. **DDS publish (~1.3ms combined)** — rclpy C-level floor. Needs zero-copy transport or
+1. **colorize (~1.4ms combined)** — ~13 intermediate tensor allocations per call from
+   scalar color math. Could fuse into a single matrix multiply.
+2. **to_cpu (~1.1ms combined)** — clamp → byte → permute → contiguous → .cpu() → .numpy()
+   chain. Pre-allocated pinned download buffers + in-place ops could help.
+3. **rgb_up (~0.7ms)** — per-frame allocation. Pinned pre-allocated buffer would help.
+4. **DDS publish (~1.1ms combined)** — rclpy C-level floor. Needs zero-copy transport or
    C extension to improve.
 
 ## Ideas backlog
