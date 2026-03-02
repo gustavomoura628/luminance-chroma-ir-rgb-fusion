@@ -43,7 +43,8 @@ Baseline: ROS2 node, stereo (L+R eyes), 640x480/eye, frozen warp, rosbag source,
 | 1 | Pre-alloc publish buffers (single memcpy) | 5.5-6.2ms | ~-0.4ms | replaced |
 | 2 | Reuse Image msg object + split pub timing | 5.3-5.9ms | ~-0.2ms | replaced |
 | 3 | torch.set_num_threads(1) | 5.3-5.9ms | ~0ms | reverted — no effect on latency or CPU usage |
-| 4 | Shared RGB upload (node uploads once, both eyes reuse) | 4.5-5.1ms | ~-0.8ms | **active** |
+| 4 | Shared RGB upload (node uploads once, both eyes reuse) | 4.5-5.1ms | ~-0.8ms | replaced |
+| 5 | Fuse color math into single matmul (3x3 @ warped) | 3.9-4.3ms | ~-0.4ms | **active** |
 
 ### Breakdown rev 0 — baseline (frozen warp)
 
@@ -118,14 +119,38 @@ dds_R:     0.3ms
 total:     4.5-5.1ms typical
 ```
 
-### Top bottlenecks (target: <4ms)
+### Breakdown rev 5 — fused matmul color math (frozen warp)
 
-1. **colorize (~1.4ms combined)** — ~13 intermediate tensor allocations per call from
-   scalar color math. Could fuse into a single matrix multiply.
-2. **to_cpu (~1.1ms combined)** — clamp → byte → permute → contiguous → .cpu() → .numpy()
+```
+decode:    0.0ms
+resize:    0.0ms
+rgb_up:    0.6-0.7ms
+
+L pipeline: 1.3ms
+  submit:  0.0ms
+  crop:    0.1ms
+  to_gpu:  0.0ms
+  colorize: 0.6ms      (down from 0.8 — matmul replaces ~13 scalar ops)
+  to_cpu:  0.5ms
+
+R pipeline: 1.0ms
+  colorize: 0.4ms      (down from 0.6)
+  to_cpu:  0.5ms
+
+msg_L:     0.2ms
+dds_L:     0.4ms
+msg_R:     0.2ms
+dds_R:     0.3ms
+
+total:     3.9-4.3ms typical, best 3.9ms
+```
+
+### Top bottlenecks (target: <4ms — achieved on best frames)
+
+1. **to_cpu (~1.0ms combined)** — clamp → byte → permute → contiguous → .cpu() → .numpy()
    chain. Pre-allocated pinned download buffers + in-place ops could help.
-3. **rgb_up (~0.7ms)** — per-frame allocation. Pinned pre-allocated buffer would help.
-4. **DDS publish (~1.1ms combined)** — rclpy C-level floor. Needs zero-copy transport or
+2. **rgb_up (~0.7ms)** — per-frame allocation. Pinned pre-allocated buffer would help.
+3. **DDS publish (~1.1ms combined)** — rclpy C-level floor. Needs zero-copy transport or
    C extension to improve.
 
 ## Ideas backlog

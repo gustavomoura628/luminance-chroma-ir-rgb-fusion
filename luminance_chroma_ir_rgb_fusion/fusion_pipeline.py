@@ -62,6 +62,16 @@ class FusionPipeline:
         self._grid: torch.Tensor | None = None
         self._grid_key: object = None  # (id(M), crop) cache key
 
+        # Pre-computed color matrix: fuse(3x2) @ chroma(2x3) = (3x3)
+        # Combines chroma extraction + luma fusion into one matmul.
+        #   chroma: RGB → (Cr, Cb) offsets
+        #   fuse:   (Cr, Cb) → per-channel offsets added to IR luma
+        M_fuse = np.array([[1.403, 0], [-0.714, -0.344], [0, 1.773]])
+        M_chroma = np.array([[0.5, -0.419, -0.081], [-0.169, -0.331, 0.5]])
+        self._M_color = torch.tensor(
+            M_fuse @ M_chroma, dtype=torch.float32, device=self._device,
+        )
+
         # Async warp worker
         self._lock = threading.Lock()
         self._event = threading.Event()
@@ -277,18 +287,12 @@ class FusionPipeline:
         warped = F.grid_sample(
             rgb_t, grid, mode="bilinear", padding_mode="zeros", align_corners=True,
         )
-        R, G, B = warped[0, 0], warped[0, 1], warped[0, 2]
 
-        # Extract chroma from warped RGB
-        Cr_off = 0.500 * R - 0.419 * G - 0.081 * B
-        Cb_off = -0.169 * R - 0.331 * G + 0.500 * B
-
-        # Fuse: IR luma + RGB chroma
-        R_out = ir_t + 1.403 * Cr_off
-        G_out = ir_t - 0.714 * Cr_off - 0.344 * Cb_off
-        B_out = ir_t + 1.773 * Cb_off
-
-        return torch.stack([R_out, G_out, B_out], dim=0)
+        # Fused color math: M_color(3,3) @ warped(3,N) + IR luma
+        # Replaces ~13 scalar temp allocations with one matmul + one add.
+        roi_h, roi_w = y2 - y1, x2 - x1
+        chroma = torch.mm(self._M_color, warped.squeeze(0).reshape(3, -1))
+        return chroma.view(3, roi_h, roi_w) + ir_t.unsqueeze(0)
 
     # ------------------------------------------------------------------
     # Runtime parameter updates
