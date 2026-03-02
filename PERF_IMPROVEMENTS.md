@@ -355,24 +355,49 @@ Observed pattern: 22-28fps instead of 30fps, with interval peaks at multiples of
 None of these helped because the bottleneck is FastDDS fragmenting large messages into
 UDP datagrams and losing fragments on loopback, requiring retransmission.
 
-### Options to investigate
+### Root cause
 
-1. **FastDDS shared memory transport** — bypasses UDP entirely for same-machine comms.
-   Would fix the on-robot path (camera driver → fusion node) which is the critical one.
-   Won't help remote viewers (teleop workstation).
-2. **Switch to CycloneDDS** (`export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`) — handles
-   large messages better out of the box, ROS 2 Humble default.
-3. **FastDDS XML profile tuning** — increase send/receive buffer sizes, socket buffer
-   sizes, fragment sizes.
-4. **Reduce message size** — publish as a more compact format (e.g. YCbCr packed in
-   mono16, ~600KB instead of 900KB).
-5. **CycloneDDS + iceoryx shared memory** — zero-copy transport, eliminates serialize +
-   memcpy entirely. Best possible solution but most setup.
+FastDDS default SHM transport segment size is ~512KB. A 640x480 rgb8 message is 921,600
+bytes (~900KB) — exceeds the segment, so FastDDS falls back to UDP with fragmentation.
+UDP fragments get lost on loopback, requiring retransmission and causing frame drops.
+Mono8 messages (~300KB) fit in the default segment and use SHM without issues.
 
-For the actual robot deployment, option 1 or 5 is likely sufficient since the fusion
-node runs on the same machine as the camera driver. The remote viewer problem is
-separate and may need transport-level tuning or a dedicated video streaming path
-(e.g. H.264/H.265 over RTP) rather than raw DDS image transport.
+### Fix — FastDDS SHM with larger segment
+
+XML profile (`cpp/config/fastdds_profile.xml`) that forces SHM-only transport with a
+4MB segment:
+
+```xml
+<transport_descriptor>
+    <transport_id>shm_transport</transport_id>
+    <type>SHM</type>
+    <segment_size>4194304</segment_size>
+</transport_descriptor>
+```
+
+Applied via environment variable (must be set for ALL processes):
+```
+export FASTRTPS_DEFAULT_PROFILES_FILE=.../cpp/config/fastdds_profile.xml
+```
+
+**Results (viewer, all streams):**
+```
+IR       30 fps   33.2ms  peak  50.6ms
+Fused    30 fps   33.3ms  peak  50.5ms
+RGB      30 fps   33.0ms  peak  53.0ms
+```
+
+All streams solid 30fps. Peaks ~50ms are just input jitter from the bag, not transport.
+
+| Stream | Before (UDP fallback) | After (SHM 4MB) |
+|--------|-----------------------|------------------|
+| IR     | 30fps, ~50ms peaks    | 30fps, ~50ms peaks |
+| RGB    | 22-28fps, 100-167ms peaks | 30fps, ~53ms peaks |
+| Fused  | 22-28fps, 100-300ms peaks | 30fps, ~50ms peaks |
+
+**Limitation:** SHM only works for same-machine communication. Remote viewers (teleop
+workstation) will still use UDP and may need transport-level tuning or a dedicated video
+streaming path (e.g. H.264/H.265 over RTP) rather than raw DDS image transport.
 
 ---
 
