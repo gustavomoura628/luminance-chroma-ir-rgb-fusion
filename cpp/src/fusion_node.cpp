@@ -109,6 +109,10 @@ private:
         freeze_after_desc.description = "Seconds of EMA before auto-freezing (auto mode only)";
         declare_parameter("freeze_after", 5.0, freeze_after_desc);
 
+        rcl_interfaces::msg::ParameterDescriptor lock_rotation_desc;
+        lock_rotation_desc.description = "Rotation lock mode: \"auto\", \"on\", or \"off\"";
+        declare_parameter("lock_rotation", "off", lock_rotation_desc);
+
         rcl_interfaces::msg::ParameterDescriptor crop_desc;
         crop_desc.description = "Crop to valid overlap region (true) or full IR frame (false)";
         declare_parameter("crop", false, crop_desc);
@@ -136,6 +140,7 @@ private:
         p.freeze_mode = get_parameter("freeze_mode").as_string();
         p.freeze_after = static_cast<float>(get_parameter("freeze_after").as_double());
         p.crop = get_parameter("crop").as_bool();
+        p.lock_rotation = get_parameter("lock_rotation").as_string();
 
         pipeline_left_ = std::make_unique<FusionPipeline>(p);
         pipeline_right_ = std::make_unique<FusionPipeline>(p);
@@ -252,6 +257,16 @@ private:
                 pipeline_left_->set_freeze_after(v);
                 pipeline_right_->set_freeze_after(v);
                 RCLCPP_INFO(get_logger(), "freeze_after -> %.1f", v);
+            } else if (p.get_name() == "lock_rotation") {
+                auto v = p.as_string();
+                if (v != "auto" && v != "on" && v != "off") {
+                    result.successful = false;
+                    result.reason = "Invalid lock_rotation: \"" + v + "\"";
+                    return result;
+                }
+                pipeline_left_->set_lock_rotation(v);
+                pipeline_right_->set_lock_rotation(v);
+                RCLCPP_INFO(get_logger(), "lock_rotation -> %s", v.c_str());
             } else if (p.get_name() == "crop") {
                 pipeline_left_->set_crop(p.as_bool());
                 pipeline_right_->set_crop(p.as_bool());

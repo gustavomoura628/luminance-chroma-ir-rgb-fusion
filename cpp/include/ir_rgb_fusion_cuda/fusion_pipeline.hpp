@@ -25,6 +25,7 @@ public:
         int orb_features = 1000;
         float ema_alpha = 0.2f;
         std::string freeze_mode = "auto";  // "auto", "on", "off"
+        std::string lock_rotation = "off"; // "auto", "on", "off"
         float freeze_after = 5.0f;
         bool crop = false;
     };
@@ -60,6 +61,7 @@ public:
     void set_freeze_after(float seconds);
     void set_crop(bool crop);
     bool get_crop() const { return params_.crop; }
+    void set_lock_rotation(const std::string& mode);
 
 private:
     Params params_;
@@ -73,6 +75,16 @@ private:
     std::atomic<bool> frozen_{false};
     std::chrono::steady_clock::time_point start_time_;
 
+    // Crop computation
+    struct Roi { int x1, y1, x2, y2; };
+    std::optional<Roi> compute_crop(const cv::Mat& M, int W, int H);
+
+    // Rotation lock state
+    std::atomic<bool> rotation_locked_{false};
+    double locked_theta_ = 0.0;
+    std::optional<Roi> locked_crop_;
+    void constrain_rotation(cv::Mat& M) const;
+
     // Background ORB worker
     std::mutex pending_mutex_;
     std::condition_variable pending_cv_;
@@ -80,10 +92,6 @@ private:
     bool worker_stop_ = false;
     std::thread worker_thread_;
     void warp_worker();
-
-    // Crop computation
-    struct Roi { int x1, y1, x2, y2; };
-    std::optional<Roi> compute_crop(const cv::Mat& M, int W, int H);
 
     // GPU buffers (lazy-allocated, reused across frames)
     int buf_roi_h_ = 0, buf_roi_w_ = 0;

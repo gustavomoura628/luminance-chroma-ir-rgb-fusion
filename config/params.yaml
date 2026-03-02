@@ -12,5 +12,6 @@ fusion_node:
     orb_features: 1000
     ema_alpha: 0.2
     freeze_mode: "auto"
+    lock_rotation: "off"
     freeze_after: 5.0
     crop: true

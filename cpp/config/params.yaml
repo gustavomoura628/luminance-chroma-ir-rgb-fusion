@@ -10,7 +10,8 @@ fusion_node:
     fused_right_topic: /camera/fused/right
     sync_slop: 0.005
     orb_features: 1000
-    ema_alpha: 0.2
+    ema_alpha: 0.05
     freeze_mode: "off"
+    lock_rotation: "on"
     freeze_after: 5.0
     crop: true

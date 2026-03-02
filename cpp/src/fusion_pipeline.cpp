@@ -95,6 +95,32 @@ void FusionPipeline::submit_warp(const cv::Mat& rgb_gray, const cv::Mat& ir_gray
         return;
     }
 
+    // Auto rotation-lock check (shares freeze_after timer, does NOT return)
+    if (!rotation_locked_.load(std::memory_order_relaxed) &&
+        params_.lock_rotation == "auto") {
+        std::lock_guard<std::mutex> lock(warp_mutex_);
+        if (M_.has_value()) {
+            auto elapsed = std::chrono::steady_clock::now() - start_time_;
+            float secs = std::chrono::duration<float>(elapsed).count();
+            if (secs > params_.freeze_after) {
+                double a = M_->at<double>(0, 0);
+                double b = M_->at<double>(0, 1);
+                locked_theta_ = std::atan2(b, a);
+                rotation_locked_.store(true, std::memory_order_release);
+            }
+        }
+    }
+    if (!rotation_locked_.load(std::memory_order_relaxed) &&
+        params_.lock_rotation == "on") {
+        std::lock_guard<std::mutex> lock(warp_mutex_);
+        if (M_.has_value()) {
+            double a = M_->at<double>(0, 0);
+            double b = M_->at<double>(0, 1);
+            locked_theta_ = std::atan2(b, a);
+            rotation_locked_.store(true, std::memory_order_release);
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lock(pending_mutex_);
         pending_ = std::make_pair(rgb_gray.clone(), ir_gray.clone());
@@ -152,6 +178,11 @@ void FusionPipeline::warp_worker() {
             pts1, pts2, inliers, cv::RANSAC, 5.0);
         if (M.empty()) continue;
 
+        // Constrain rotation before EMA if locked
+        if (rotation_locked_.load(std::memory_order_acquire)) {
+            constrain_rotation(M);
+        }
+
         // EMA smoothing + update
         {
             std::lock_guard<std::mutex> lock(warp_mutex_);
@@ -163,6 +194,27 @@ void FusionPipeline::warp_worker() {
             M_dirty_ = true;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rotation constraint
+// ---------------------------------------------------------------------------
+
+void FusionPipeline::constrain_rotation(cv::Mat& M) const {
+    // Decompose similarity: M = [[s*cos(θ), -s*sin(θ), tx],
+    //                             [s*sin(θ),  s*cos(θ), ty]]
+    double a = M.at<double>(0, 0);
+    double b = M.at<double>(0, 1);
+    double s = std::sqrt(a * a + b * b);
+
+    // Reconstruct with locked theta, preserving scale and translation
+    double cos_t = std::cos(locked_theta_);
+    double sin_t = std::sin(locked_theta_);
+    M.at<double>(0, 0) =  s * cos_t;
+    M.at<double>(0, 1) = -s * sin_t;
+    M.at<double>(1, 0) =  s * sin_t;
+    M.at<double>(1, 1) =  s * cos_t;
+    // tx, ty (columns 2) left untouched
 }
 
 // ---------------------------------------------------------------------------
@@ -217,7 +269,16 @@ bool FusionPipeline::launch_async(
     auto crop_opt = compute_crop(M_copy, ir_w, ir_h);
     if (!crop_opt.has_value()) return false;
 
-    Roi roi = params_.crop ? *crop_opt : Roi{0, 0, ir_w, ir_h};
+    // Lock crop ROI on first frame after rotation lock
+    if (rotation_locked_.load(std::memory_order_relaxed)) {
+        if (!locked_crop_.has_value()) {
+            locked_crop_ = *crop_opt;
+        }
+    }
+
+    Roi roi = params_.crop
+        ? (locked_crop_.has_value() ? *locked_crop_ : *crop_opt)
+        : Roi{0, 0, ir_w, ir_h};
     roi_h = cur_roi_h_ = roi.y2 - roi.y1;
     roi_w = cur_roi_w_ = roi.x2 - roi.x1;
 
@@ -311,8 +372,38 @@ void FusionPipeline::set_freeze_after(float seconds) {
         frozen_.store(false, std::memory_order_relaxed);
         start_time_ = std::chrono::steady_clock::now();
     }
+    // Also reset rotation lock if it was auto-locked
+    if (params_.lock_rotation == "auto" &&
+        rotation_locked_.load(std::memory_order_relaxed)) {
+        rotation_locked_.store(false, std::memory_order_relaxed);
+        locked_crop_.reset();
+        start_time_ = std::chrono::steady_clock::now();
+    }
 }
 
 void FusionPipeline::set_crop(bool crop) {
     params_.crop = crop;
+}
+
+void FusionPipeline::set_lock_rotation(const std::string& mode) {
+    if (mode == params_.lock_rotation) return;
+    params_.lock_rotation = mode;
+    if (mode == "off") {
+        rotation_locked_.store(false, std::memory_order_relaxed);
+        locked_crop_.reset();
+    } else if (mode == "on") {
+        // Lock immediately from current M if available
+        std::lock_guard<std::mutex> lock(warp_mutex_);
+        if (M_.has_value()) {
+            double a = M_->at<double>(0, 0);
+            double b = M_->at<double>(0, 1);
+            locked_theta_ = std::atan2(b, a);
+            rotation_locked_.store(true, std::memory_order_release);
+        }
+        locked_crop_.reset();
+    } else if (mode == "auto") {
+        rotation_locked_.store(false, std::memory_order_relaxed);
+        locked_crop_.reset();
+        start_time_ = std::chrono::steady_clock::now();
+    }
 }
