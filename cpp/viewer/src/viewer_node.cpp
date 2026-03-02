@@ -1,4 +1,6 @@
 #include <chrono>
+#include <csignal>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -78,6 +80,32 @@ struct StreamState {
     std::vector<std::string> topics;
     std::vector<std::string> encodings; // expected encoding per topic
     std::vector<rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr> subs;
+};
+
+// ---------------------------------------------------------------------------
+// RecorderState: ffmpeg pipe-based video recording
+// ---------------------------------------------------------------------------
+struct RecordRow {
+    int stream_idx;
+    bool stereo;
+    int y_offset;
+    int row_h;
+    int row_w;      // total content width for this row
+    int left_w;     // frozen left/single image width
+    int right_w;    // frozen right image width (stereo only)
+};
+
+struct RecorderState {
+    bool active = false;
+    FILE* pipe = nullptr;
+    std::string filename;
+    int canvas_w = 0;
+    int canvas_h = 0;
+    std::vector<RecordRow> rows;
+    std::vector<uint8_t> frame_buf;
+    std::chrono::steady_clock::time_point last_frame_time;
+    std::chrono::steady_clock::time_point start_time;
+    int frame_count = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -173,6 +201,183 @@ static void toggle_stream(StreamState& st, rclcpp::Node* node) {
 }
 
 // ---------------------------------------------------------------------------
+// Recording
+// ---------------------------------------------------------------------------
+static void start_recording(RecorderState& rec, StreamState streams[3]) {
+    if (rec.active) return;
+
+    rec.rows.clear();
+    rec.canvas_w = 0;
+    rec.canvas_h = 0;
+
+    for (int si = 0; si < 3; ++si) {
+        if (!streams[si].enabled) continue;
+        auto& s0 = streams[si].slots[0];
+        if (s0.w == 0 || s0.h == 0) continue;
+
+        RecordRow row;
+        row.stream_idx = si;
+        row.stereo = streams[si].stereo;
+        row.left_w = s0.w;
+        row.right_w = 0;
+        row.row_h = s0.h;
+
+        if (row.stereo) {
+            auto& s1 = streams[si].slots[1];
+            row.right_w = (s1.w > 0 && s1.h > 0) ? s1.w : s0.w;
+            row.row_h = std::max(s0.h, (s1.h > 0) ? s1.h : s0.h);
+            row.row_w = row.left_w + row.right_w;
+        } else {
+            row.row_w = row.left_w;
+        }
+
+        row.y_offset = rec.canvas_h;
+        rec.rows.push_back(row);
+        rec.canvas_h += row.row_h;
+        if (row.row_w > rec.canvas_w) rec.canvas_w = row.row_w;
+    }
+
+    if (rec.rows.empty()) {
+        RCLCPP_WARN(rclcpp::get_logger("viewer"),
+            "No streams with data — cannot start recording");
+        return;
+    }
+
+    // yuv420p requires even dimensions
+    if (rec.canvas_w % 2 != 0) rec.canvas_w += 1;
+    if (rec.canvas_h % 2 != 0) rec.canvas_h += 1;
+
+    // Timestamped filename
+    auto now_sys = std::chrono::system_clock::now();
+    auto tt = std::chrono::system_clock::to_time_t(now_sys);
+    struct tm tm_buf;
+    localtime_r(&tt, &tm_buf);
+    char fname[64];
+    snprintf(fname, sizeof(fname), "viewer_%04d%02d%02d_%02d%02d%02d.mp4",
+        tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
+        tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
+    rec.filename = fname;
+
+    // Allocate zero-initialized frame buffer
+    rec.frame_buf.assign(
+        static_cast<size_t>(rec.canvas_w) * rec.canvas_h * 3, 0);
+
+    // Open ffmpeg pipe
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+        "ffmpeg -y -f rawvideo -pixel_format rgb24 -video_size %dx%d "
+        "-framerate 30 -i pipe:0 -c:v libx264 -preset fast -crf 18 "
+        "-pix_fmt yuv420p -movflags +faststart '%s' 2>/dev/null",
+        rec.canvas_w, rec.canvas_h, rec.filename.c_str());
+
+    rec.pipe = popen(cmd, "w");
+    if (!rec.pipe) {
+        RCLCPP_ERROR(rclcpp::get_logger("viewer"),
+            "Failed to start ffmpeg for recording");
+        rec.frame_buf.clear();
+        rec.rows.clear();
+        return;
+    }
+
+    rec.active = true;
+    rec.frame_count = 0;
+    rec.start_time = std::chrono::steady_clock::now();
+    rec.last_frame_time = rec.start_time;
+    RCLCPP_INFO(rclcpp::get_logger("viewer"),
+        "Recording started: %s (%dx%d)", fname, rec.canvas_w, rec.canvas_h);
+}
+
+static void stop_recording(RecorderState& rec) {
+    if (!rec.active) return;
+    rec.active = false;
+    if (rec.pipe) {
+        pclose(rec.pipe);
+        rec.pipe = nullptr;
+    }
+    RCLCPP_INFO(rclcpp::get_logger("viewer"),
+        "Recording stopped: %s (%d frames)", rec.filename.c_str(), rec.frame_count);
+    rec.frame_buf.clear();
+    rec.frame_buf.shrink_to_fit();
+    rec.rows.clear();
+}
+
+static void compose_and_write_frame(RecorderState& rec, StreamState streams[3]) {
+    if (!rec.active) return;
+
+    // 30fps pacing
+    auto now = std::chrono::steady_clock::now();
+    double elapsed_ms = std::chrono::duration<double, std::milli>(
+        now - rec.last_frame_time).count();
+    if (elapsed_ms < 33.0) return;
+    rec.last_frame_time = now;
+
+    // Clear to black
+    std::memset(rec.frame_buf.data(), 0, rec.frame_buf.size());
+
+    for (auto& row : rec.rows) {
+        StreamState& st = streams[row.stream_idx];
+        uint8_t* row_ptr = rec.frame_buf.data() +
+            static_cast<size_t>(row.y_offset) * rec.canvas_w * 3;
+
+        if (row.stereo) {
+            // Left image at x=0
+            auto& left = st.slots[0];
+            if (left.w > 0 && left.h > 0) {
+                int copy_w = std::min(left.w, row.left_w);
+                int copy_h = std::min(left.h, row.row_h);
+                for (int y = 0; y < copy_h; ++y) {
+                    std::memcpy(
+                        row_ptr + y * rec.canvas_w * 3,
+                        left.buffer.data() + y * left.w * 3,
+                        static_cast<size_t>(copy_w) * 3);
+                }
+            }
+            // Right image flush after left (at x=left_w)
+            auto& right = st.slots[1];
+            if (right.w > 0 && right.h > 0) {
+                int copy_w = std::min(right.w, row.right_w);
+                int copy_h = std::min(right.h, row.row_h);
+                for (int y = 0; y < copy_h; ++y) {
+                    std::memcpy(
+                        row_ptr + y * rec.canvas_w * 3 + row.left_w * 3,
+                        right.buffer.data() + y * right.w * 3,
+                        static_cast<size_t>(copy_w) * 3);
+                }
+            }
+        } else {
+            // Mono: centered horizontally in canvas
+            auto& slot = st.slots[0];
+            if (slot.w > 0 && slot.h > 0) {
+                int copy_w = std::min(slot.w, row.left_w);
+                int copy_h = std::min(slot.h, row.row_h);
+                int x_off = (rec.canvas_w - row.left_w) / 2;
+                for (int y = 0; y < copy_h; ++y) {
+                    std::memcpy(
+                        row_ptr + y * rec.canvas_w * 3 + x_off * 3,
+                        slot.buffer.data() + y * slot.w * 3,
+                        static_cast<size_t>(copy_w) * 3);
+                }
+            }
+        }
+    }
+
+    // Write frame to pipe
+    size_t frame_size = rec.frame_buf.size();
+    size_t written = fwrite(rec.frame_buf.data(), 1, frame_size, rec.pipe);
+    if (written != frame_size) {
+        RCLCPP_WARN(rclcpp::get_logger("viewer"),
+            "Recording broken pipe — stopping");
+        rec.active = false;
+        pclose(rec.pipe);
+        rec.pipe = nullptr;
+        rec.frame_buf.clear();
+        rec.rows.clear();
+        return;
+    }
+    rec.frame_count++;
+}
+
+// ---------------------------------------------------------------------------
 // Rendering helpers
 // ---------------------------------------------------------------------------
 
@@ -195,6 +400,7 @@ static void draw_image_slot(const ImageSlot& slot, ImVec2 avail) {
 // ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
+    signal(SIGPIPE, SIG_IGN);
     auto node = std::make_shared<rclcpp::Node>("stream_viewer");
 
     // --- SDL2 + OpenGL init ---
@@ -263,6 +469,7 @@ int main(int argc, char** argv) {
 
     bool flip_lr = false;
     bool quit = false;
+    RecorderState rec;
     auto last_log = std::chrono::steady_clock::now();
 
     // --- Main loop ---
@@ -292,6 +499,10 @@ int main(int argc, char** argv) {
                     case SDLK_2: toggle_stream(streams[2], node.get()); break; // RGB
                     case SDLK_3: toggle_stream(streams[0], node.get()); break; // IR
                     case SDLK_f: flip_lr = !flip_lr; break;
+                    case SDLK_r:
+                        if (rec.active) stop_recording(rec);
+                        else start_recording(rec, streams);
+                        break;
                     case SDLK_ESCAPE: quit = true; break;
                 }
             }
@@ -299,6 +510,9 @@ int main(int argc, char** argv) {
 
         // Process ROS callbacks (same thread — no mutex needed)
         rclcpp::spin_some(node);
+
+        // Compose recording frame (reads slot buffers before texture upload)
+        compose_and_write_frame(rec, streams);
 
         // Upload new texture data
         for (auto& st : streams) {
@@ -388,6 +602,33 @@ int main(int argc, char** argv) {
         ImGui::Separator();
         ImGui::Checkbox("[F] Flip L/R", &flip_lr);
 
+        ImGui::Separator();
+        if (!rec.active) {
+            if (ImGui::Button("[R] Record")) {
+                start_recording(rec, streams);
+            }
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.7f, 0.1f, 0.1f, 1.0f));
+            if (ImGui::Button("[R] Stop")) {
+                stop_recording(rec);
+            }
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+            double rec_elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - rec.start_time).count();
+            bool blink = static_cast<int>(rec_elapsed * 2) % 2 == 0;
+            if (blink) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.2f, 0.2f, 1.0f));
+                ImGui::Text("REC");
+                ImGui::PopStyleColor();
+            } else {
+                ImGui::TextDisabled("REC");
+            }
+            ImGui::SameLine();
+            int secs = static_cast<int>(rec_elapsed);
+            ImGui::TextDisabled("%d:%02d  %s", secs / 60, secs % 60, rec.filename.c_str());
+        }
+
         ImGui::End();
 
         ImGui::Render();
@@ -397,6 +638,8 @@ int main(int argc, char** argv) {
     }
 
     // --- Cleanup ---
+    stop_recording(rec);
+
     for (auto& st : streams) {
         destroy_subscriptions(st);
         for (auto& slot : st.slots) {
