@@ -114,8 +114,8 @@ robot publishing on the network), you need to match the robot's DDS setup:
 
 ```bash
 export FASTRTPS_DEFAULT_PROFILES_FILE=$(pwd)/cpp/config/fastdds_profile.xml
-export ROS_DOMAIN_ID=<robot's domain id>
-export ROS_DISCOVERY_SERVER="<robot's discovery server address>"
+export ROS_DOMAIN_ID=<"robot's domain id">
+export ROS_DISCOVERY_SERVER=<"robot's discovery server address">
 export ROS_SUPER_CLIENT=True
 source /opt/ros/humble/setup.bash
 source ~/ros2_ws/install/setup.bash
