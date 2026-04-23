@@ -14,12 +14,8 @@ Each frame, the node:
 
 1. **Aligns** the RGB image to each IR viewpoint using ORB feature matching + RANSAC affine estimation
 2. **Extracts chroma** (color information) from the warped RGB
-3. **Replaces luma** (brightness) with the IR image — IR has better contrast and isn't affected by the projector pattern
+3. **Replaces luma** (brightness) with the IR image
 4. **Outputs** two colorized images: one for the left eye, one for the right
-
-The warp matrix is smoothed with an EMA filter and auto-freezes after convergence, so ORB only runs for the first few seconds. The color math runs on GPU via PyTorch.
-
-The tradeoff with freezing: the warp matrix is a global affine transform, but the true RGB-to-IR mapping is depth-dependent. A single affine works well when the whole scene is at a similar depth — running ORB continuously (`freeze_mode: "off"`) lets the warp adapt as the robot moves closer to a wall or cabinet, for example. But it does NOT help with mixed-depth scenes: close foreground objects (a hand, a tool) against a distant background get misaligned because ORB matches are dominated by background features. Freezing adds no latency cost (~1.5ms either way with the CUDA node) but eliminates warp jitter on low-texture scenes.
 
 ## Topics
 
@@ -41,15 +37,15 @@ The fusion node is implemented in C++ + CUDA (1.4-1.8ms/frame on 640x480 stereo)
 
 - ROS 2 Humble
 - NVIDIA GPU with CUDA support
-- `nvidia-cuda-toolkit` (or CUDA toolkit installed to `/usr/local/cuda`)
+- NVIDIA CUDA Toolkit
 - OpenCV 4.x with `features2d` and `calib3d` modules
 
 ### Build
 
 ```bash
-# Symlink into your ROS 2 workspace (once)
+# Symlink into your ROS 2 workspace
 cd ~/ros2_ws/src
-ln -s ~/projects/luminance-chroma-ir-rgb-fusion .
+ln -s /path/to/luminance-chroma-ir-rgb-fusion .
 
 # Build C++ CUDA fusion node
 cd ~/ros2_ws
@@ -64,7 +60,7 @@ FastDDS's default shared memory segment (~512KB) is too small for rgb8 images (~
 export FASTRTPS_DEFAULT_PROFILES_FILE=$(pwd)/cpp/config/fastdds_profile.xml
 ```
 
-This forces SHM-only transport with a 4MB segment. See `PERF_IMPROVEMENTS.md` for details.
+This forces SHM-only transport with a 4MB segment.
 
 ### Run (live RealSense camera)
 
@@ -82,7 +78,7 @@ ros2 launch ir_rgb_fusion_cuda fusion.launch.py
 
 ### Run (local bag playback)
 
-Every terminal needs the same DDS environment. Set it once per shell:
+Every terminal needs the same DDS environment. 
 
 ```bash
 export FASTRTPS_DEFAULT_PROFILES_FILE=$(pwd)/cpp/config/fastdds_profile.xml
@@ -93,25 +89,22 @@ source /opt/ros/humble/setup.bash
 source ~/ros2_ws/install/setup.bash
 ```
 
-> **Gotcha:** If your shell profile sets `ROS_DOMAIN_ID`, `ROS_DISCOVERY_SERVER`, or
-> `ROS_SUPER_CLIENT` (e.g. for connecting to a real robot), you *must* override them
-> as shown above. Mismatched DDS domains between terminals means processes can't
-> discover each other — the fusion node will start but receive zero frames.
-
-Then in two terminals (or tmux panes):
+Then:
 
 ```bash
 # Terminal 1 — play a rosbag
 ros2 bag play <path-to-bag> --loop
+```
 
+```bash
 # Terminal 2 — fusion node
 ros2 launch ir_rgb_fusion_cuda fusion.launch.py
 ```
 
-Or run the fusion node directly with a custom params file:
+To use a different params file:
 
 ```bash
-ros2 run ir_rgb_fusion_cuda fusion_node --ros-args --params-file cpp/config/params.yaml
+ros2 launch ir_rgb_fusion_cuda fusion.launch.py params_file:=/path/to/custom_params.yaml
 ```
 
 ### Run (real robot)
@@ -128,7 +121,7 @@ source /opt/ros/humble/setup.bash
 source ~/ros2_ws/install/setup.bash
 
 # Verify you can see the camera topics
-ros2 topic list | grep d400
+ros2 topic list | grep camera
 
 # Launch
 ros2 launch ir_rgb_fusion_cuda fusion.launch.py
@@ -150,7 +143,7 @@ ros2 run rqt_image_view rqt_image_view /camera/fused/left
 
 ## Parameters
 
-Configured via `cpp/config/params.yaml` or the launch file's `params_file` argument.
+The launch file loads `cpp/config/params.yaml` by default. Edit that file directly, or override with `params_file:=/path/to/custom.yaml`.
 
 | Parameter | Type | Default | Dynamic | Description |
 |-----------|------|---------|---------|-------------|
@@ -161,8 +154,8 @@ Configured via `cpp/config/params.yaml` or the launch file's `params_file` argum
 | `fused_right_topic` | string | `/camera/fused/right` | no | Right fused output topic |
 | `sync_slop` | double | `0.005` | no | Max IR-RGB timestamp difference to consider RGB "fresh" (seconds) |
 | `orb_features` | int | `1000` | no | Number of ORB features to detect |
-| `ema_alpha` | double | `0.2` | no | EMA smoothing factor for warp matrix |
-| `freeze_mode` | string | `"auto"` | **yes** | `"auto"`, `"on"`, or `"off"` |
+| `ema_alpha` | double | `0.5` | no | EMA smoothing factor for warp matrix |
+| `freeze_mode` | string | `"off"` | **yes** | `"auto"`, `"on"`, or `"off"` |
 | `lock_rotation` | string | `"off"` | **yes** | Lock warp rotation after convergence: `"auto"`, `"on"`, or `"off"` |
 | `freeze_after` | double | `5.0` | **yes** | Seconds before auto-freeze / auto rotation-lock |
 | `crop` | bool | `false` | **yes** | Crop output to valid warp region |
@@ -178,8 +171,6 @@ ros2 param set /fusion_node freeze_after 10.0
 
 ## Dependencies
 
-### C++ CUDA node (`ir_rgb_fusion_cuda`)
 - ROS 2 Humble: `rclcpp`, `sensor_msgs`, `rcl_interfaces`
-- CUDA toolkit (kernel compilation + runtime)
+- NVIDIA CUDA Toolkit
 - OpenCV 4.x (`core`, `imgproc`, `features2d`, `calib3d`)
-

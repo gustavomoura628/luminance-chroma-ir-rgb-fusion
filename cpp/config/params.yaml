@@ -1,11 +1,8 @@
 fusion_node:
   ros__parameters:
-    #infra1_topic: /camera/infra1/image_rect_raw
-    #infra2_topic: /camera/infra2/image_rect_raw
-    #color_topic: /camera/color/image_raw
-    infra1_topic: /d400/infra1/image_rect_raw
-    infra2_topic: /d400/infra2/image_rect_raw
-    color_topic:  /d400/color/image_raw
+    infra1_topic: /camera/infra1/image_rect_raw
+    infra2_topic: /camera/infra2/image_rect_raw
+    color_topic: /camera/color/image_raw
     fused_left_topic: /camera/fused/left
     fused_right_topic: /camera/fused/right
     sync_slop: 0.005
