@@ -1,0 +1,23 @@
+# ROS 2 / colcon build artifacts
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Editor / tooling
+.claude/
+compile_commands.json
+.vscode/
+.idea/
+
+# Viewer runtime state (written on exit by ImGui)
+imgui.ini
+
+# Rosbag recordings
+*.bag
+*.db3
+*.mcap
